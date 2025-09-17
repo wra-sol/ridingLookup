@@ -855,7 +855,6 @@ export default {
           headers: { "content-type": "text/html; charset=UTF-8" }
         });
       }
-      
       // Handle OpenAPI docs
       if (pathname === "/api/docs") {
         const baseUrl = `${url.protocol}//${url.host}`;
@@ -879,7 +878,7 @@ export default {
         });
       }
       
-      return badRequest("Not found", 404);
+      return badRequest("Not found", 404)
     } catch (err: unknown) {
       return badRequest(err instanceof Error ? err.message : "Unexpected error", 400);
     }
