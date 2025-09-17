@@ -1,0 +1,18 @@
+name = "riding-lookup"
+main = "src/worker.ts"
+compatibility_date = "2024-09-01"
+
+# Bind an R2 bucket that will store the large GeoJSON files
+# Create the bucket with: wrangler r2 bucket create ridings
+
+[[r2_buckets]]
+binding = "RIDINGS"
+bucket_name = "ridings"
+
+[vars]
+# Optional: set a geocoding provider. Supported: "nominatim" (default) or "mapbox"
+GEOCODER = "nominatim"
+# For Mapbox, set MAPBOX_TOKEN as a secret: wrangler secret put MAPBOX_TOKEN
+
+[observability]
+enabled = true

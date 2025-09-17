@@ -1,0 +1,15 @@
+{
+  "name": "ridinglookup",
+  "version": "1.0.0",
+  "description": "Provides three GET routes that return riding properties for a given location in Canada by testing the point against large GeoJSON datasets stored in R2.",
+  "main": "index.js",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250917.0"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
