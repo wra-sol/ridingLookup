@@ -54,6 +54,15 @@ wrangler r2 object put ridings/ontarioridings-2022.geojson --file ./ontarioridin
 wrangler secret put MAPBOX_TOKEN
 ```
 And set `GEOCODER = "mapbox"` in `wrangler.toml`.
+- Google Maps:
+```bash
+wrangler secret put GOOGLE_MAPS_KEY
+```
+And set `GEOCODER = "google"` in `wrangler.toml`.
+
+Alternatively, you can pass the Google API key as a header `X-Google-API-Key` with each request instead of setting the environment variable.
+
+**Note:** When using the `X-Google-API-Key` header, basic authentication is automatically bypassed, allowing users to use their own Google API key without needing the configured basic auth credentials.
 
 ### Develop and deploy
 - Local dev (uses remote R2):
