@@ -141,7 +141,7 @@ function parseQuery(request: Request) {
   return { address, postal, city, state, country, lat, lon };
 }
 
-async function geocodeIfNeeded(env: Env, qp: QueryParams): Promise<{ lon: number; lat: number; }> {
+async function geocodeIfNeeded(env: Env, qp: QueryParams, request?: Request): Promise<{ lon: number; lat: number; }> {
   if (typeof qp.lat === "number" && typeof qp.lon === "number") {
     return { lon: qp.lon, lat: qp.lat };
   }
@@ -150,8 +150,10 @@ async function geocodeIfNeeded(env: Env, qp: QueryParams): Promise<{ lon: number
 
   const provider = (env.GEOCODER || "nominatim").toLowerCase();
   if (provider === "google") {
-    const key = env.GOOGLE_MAPS_KEY;
-    if (!key) throw new Error("GOOGLE_MAPS_KEY not configured");
+    // Check for Google API key in header first, then fall back to environment variable
+    const headerKey = request?.headers.get("X-Google-API-Key");
+    const key = headerKey || env.GOOGLE_MAPS_KEY;
+    if (!key) throw new Error("Google API key not provided. Set X-Google-API-Key header or configure GOOGLE_MAPS_KEY environment variable");
     const params = new URLSearchParams({ key });
     // Prefer structured components when available
     const components: string[] = [];
@@ -234,6 +236,10 @@ function checkBasicAuth(request: Request, env: Env): boolean {
   // If BASIC_AUTH is not configured, skip authentication
   if (!env.BASIC_AUTH) return true;
   
+  // If user provides their own Google API key, bypass basic auth
+  const googleApiKey = request.headers.get("X-Google-API-Key");
+  if (googleApiKey) return true;
+  
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Basic ")) {
     return false;
@@ -274,7 +280,7 @@ export default {
       }
 
       const q = parseQuery(request);
-      const { lon, lat } = await geocodeIfNeeded(env, q);
+      const { lon, lat } = await geocodeIfNeeded(env, q, request);
       const result = await lookupRiding(env, pathname, lon, lat);
       return new Response(JSON.stringify({ query: q, point: { lon, lat }, ...result }), {
         headers: { "content-type": "application/json; charset=UTF-8" }
