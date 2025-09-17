@@ -13,6 +13,8 @@ bucket_name = "ridings"
 # Optional: set a geocoding provider. Supported: "nominatim" (default) or "mapbox"
 GEOCODER = "nominatim"
 # For Mapbox, set MAPBOX_TOKEN as a secret: wrangler secret put MAPBOX_TOKEN
+# Basic auth credentials in format "username:password" (base64 encoded)
+BASIC_AUTH = "admin:password123"
 
 [observability]
 enabled = true

@@ -5,6 +5,7 @@ export interface Env {
   GEOCODER?: string;
   MAPBOX_TOKEN?: string;
   GOOGLE_MAPS_KEY?: string;
+  BASIC_AUTH?: string;
 }
 
 interface MapboxFeature {
@@ -229,9 +230,42 @@ function badRequest(message: string, status = 400) {
   });
 }
 
+function checkBasicAuth(request: Request, env: Env): boolean {
+  // If BASIC_AUTH is not configured, skip authentication
+  if (!env.BASIC_AUTH) return true;
+  
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    return false;
+  }
+  
+  try {
+    const encoded = authHeader.substring(6); // Remove "Basic " prefix
+    const decoded = atob(encoded);
+    return decoded === env.BASIC_AUTH;
+  } catch {
+    return false;
+  }
+}
+
+function unauthorizedResponse() {
+  return new Response(JSON.stringify({ error: "Unauthorized" }), {
+    status: 401,
+    headers: { 
+      "content-type": "application/json; charset=UTF-8",
+      "WWW-Authenticate": "Basic realm=\"Riding Lookup API\""
+    }
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
+      // Check basic authentication first
+      if (!checkBasicAuth(request, env)) {
+        return unauthorizedResponse();
+      }
+      
       const url = new URL(request.url);
       const pathname = url.pathname;
       if (request.method !== "GET") return badRequest("Only GET supported", 405);
