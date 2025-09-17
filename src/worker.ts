@@ -269,10 +269,14 @@ function createOpenAPISpec(baseUrl: string) {
     openapi: "3.0.0",
     info: {
       title: "Riding Lookup API",
-      description: "API for looking up Canadian federal, provincial, and territorial ridings by location",
+      description: "Find Canadian federal, provincial, and territorial ridings by location. Supports multiple geocoding providers including Google Maps (BYOK), Mapbox, and Nominatim. Built on Cloudflare Workers for global edge performance.",
       version: "1.0.0",
       contact: {
-        name: "Riding Lookup API"
+        name: "Riding Lookup API",
+        email: "support@example.com"
+      },
+      license: {
+        name: "MIT"
       }
     },
     servers: [
@@ -281,11 +285,36 @@ function createOpenAPISpec(baseUrl: string) {
         description: "Production server"
       }
     ],
+    security: [
+      {
+        "BasicAuth": []
+      },
+      {
+        "GoogleAPIKey": []
+      }
+    ],
+    components: {
+      securitySchemes: {
+        "BasicAuth": {
+          type: "http",
+          scheme: "basic",
+          description: "Basic authentication using username and password"
+        },
+        "GoogleAPIKey": {
+          type: "apiKey",
+          in: "header",
+          name: "X-Google-API-Key",
+          description: "Google Maps API key for BYOK (Bring Your Own Key) authentication. Bypasses basic auth and provides unlimited requests with enhanced geocoding accuracy."
+        }
+      }
+    },
     paths: {
       "/api": {
         get: {
-          summary: "Lookup federal riding",
-          description: "Find the federal riding for a given location",
+          summary: "Lookup Federal Riding",
+          description: "Find the federal electoral district for any Canadian location. Supports geocoding via address, postal code, coordinates, or structured location components. Returns comprehensive riding information including district number, name, and administrative details.",
+          operationId: "lookupFederalRiding",
+          tags: ["Federal Ridings"],
           parameters: [
             {
               name: "address",
@@ -611,6 +640,11 @@ function createLandingPage(baseUrl: string) {
             border-bottom: 3px solid #3498db;
             padding-bottom: 10px;
         }
+        h2 {
+            color: #2c3e50;
+            margin-top: 30px;
+            margin-bottom: 15px;
+        }
         .endpoint {
             background: #f8f9fa;
             border-left: 4px solid #3498db;
@@ -654,6 +688,7 @@ function createLandingPage(baseUrl: string) {
         .param-name {
             font-weight: bold;
             color: #e74c3c;
+            font-family: 'Monaco', 'Menlo', monospace;
         }
         .param-desc {
             color: #666;
@@ -662,6 +697,13 @@ function createLandingPage(baseUrl: string) {
         .auth-note {
             background: #fff3cd;
             border: 1px solid #ffeaa7;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        .byok-note {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
             padding: 15px;
             border-radius: 4px;
             margin: 20px 0;
@@ -687,14 +729,14 @@ function createLandingPage(baseUrl: string) {
 </head>
 <body>
     <div class="container">
-        <h1>🏛️ Riding Lookup API</h1>
+        <h1>Riding Lookup API</h1>
         <p>Find Canadian federal, provincial, and territorial ridings by location. This API supports geocoding addresses, postal codes, and coordinates to determine which riding a location falls within.</p>
         
         <div class="auth-note">
-            <strong>🔐 Authentication:</strong> This API uses Basic Authentication. Include your credentials in the Authorization header, or provide your own Google API key via the X-Google-API-Key header to bypass authentication.
+            <strong>Authentication:</strong> This API uses Basic Authentication. Include your credentials in the Authorization header, or provide your own Google API key via the X-Google-API-Key header to bypass authentication.
         </div>
 
-        <h2>📡 API Endpoints</h2>
+        <h2>API Endpoints</h2>
         
         <div class="endpoint">
             <span class="method">GET</span>
@@ -720,7 +762,7 @@ function createLandingPage(baseUrl: string) {
             <div class="description">OpenAPI specification (JSON)</div>
         </div>
 
-        <h2>🔍 Query Parameters</h2>
+        <h2>Query Parameters</h2>
         <p>Provide location information using any of these parameters:</p>
         
         <div class="param">
@@ -752,7 +794,7 @@ function createLandingPage(baseUrl: string) {
             <span class="param-desc">Country name</span>
         </div>
 
-        <h2>📝 Example Usage</h2>
+        <h2>Example Usage</h2>
         
         <h3>By Postal Code</h3>
         <div class="example">curl -u "username:password" "${baseUrl}/api?postal=K1A 0A6"</div>
@@ -766,7 +808,14 @@ function createLandingPage(baseUrl: string) {
         <h3>Quebec Provincial Riding</h3>
         <div class="example">curl -u "username:password" "${baseUrl}/api/qc?address=1234 Rue Saint-Denis, Montréal, QC"</div>
 
-        <h2>📊 Response Format</h2>
+        <h3>Using Your Own Google API Key (BYOK)</h3>
+        <div class="example">curl -H "X-Google-API-Key: YOUR_GOOGLE_API_KEY" "${baseUrl}/api?address=24 Sussex Drive, Ottawa, ON"</div>
+        
+        <div class="byok-note">
+            <strong>BYOK Benefits:</strong> Using your own Google Maps API key bypasses basic authentication and provides unlimited requests with enhanced geocoding accuracy. You get your own usage tracking and billing.
+        </div>
+
+        <h2>Response Format</h2>
         <div class="example">{
   "query": {
     "postal": "K1A 0A6"
@@ -783,8 +832,8 @@ function createLandingPage(baseUrl: string) {
 }</div>
 
         <div class="links">
-            <a href="${baseUrl}/api/docs" target="_blank">📋 OpenAPI Docs</a>
-            <a href="https://github.com" target="_blank">🐙 GitHub</a>
+            <a href="${baseUrl}/api/docs" target="_blank">OpenAPI Docs</a>
+            <a href="https://github.com" target="_blank">GitHub</a>
         </div>
     </div>
 </body>
