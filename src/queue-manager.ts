@@ -4,7 +4,8 @@ export interface QueueJob {
   id: string;
   batchId: string;
   request: BatchLookupRequest;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'retrying';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'retrying' | 'dead_letter';
+  priority: number; // Higher number = higher priority
   attempts: number;
   maxAttempts: number;
   createdAt: number;
@@ -14,6 +15,9 @@ export interface QueueJob {
   result?: BatchLookupResponse;
   error?: string;
   processingTime?: number;
+  lastError?: string;
+  errorCount: number;
+  tags?: string[];
 }
 
 export interface BatchJob {
@@ -64,6 +68,12 @@ export interface QueueStats {
   deadLetterJobs: number;
   averageProcessingTime: number;
   successRate: number;
+  priorityDistribution: Record<number, number>;
+  errorRate: number;
+  throughput: number; // jobs per minute
+  oldestPendingJob: number;
+  deadLetterQueueSize: number;
+  retryQueueSize: number;
 }
 
 export class QueueManager {
@@ -74,6 +84,7 @@ export class QueueManager {
   private processingQueue: string[] = [];
   private retryQueue: string[] = [];
   private deadLetterQueue: string[] = [];
+  private priorityQueues: Map<number, string[]> = new Map();
   private stats: QueueStats = {
     totalJobs: 0,
     pendingJobs: 0,
@@ -83,12 +94,102 @@ export class QueueManager {
     retryingJobs: 0,
     deadLetterJobs: 0,
     averageProcessingTime: 0,
-    successRate: 0
+    successRate: 0,
+    priorityDistribution: {},
+    errorRate: 0,
+    throughput: 0,
+    oldestPendingJob: 0,
+    deadLetterQueueSize: 0,
+    retryQueueSize: 0
   };
+  private lastProcessedTime: number = Date.now();
+  private processedJobsCount: number = 0;
 
   constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
+  }
+
+  // Priority queue management
+  private addToPriorityQueue(jobId: string, priority: number): void {
+    if (!this.priorityQueues.has(priority)) {
+      this.priorityQueues.set(priority, []);
+    }
+    this.priorityQueues.get(priority)!.push(jobId);
+  }
+
+  private removeFromPriorityQueue(jobId: string, priority: number): void {
+    const queue = this.priorityQueues.get(priority);
+    if (queue) {
+      const index = queue.indexOf(jobId);
+      if (index > -1) {
+        queue.splice(index, 1);
+      }
+    }
+  }
+
+  private getNextJobFromPriorityQueues(): string | null {
+    // Get all priority levels sorted in descending order (highest first)
+    const priorities = Array.from(this.priorityQueues.keys()).sort((a, b) => b - a);
+    
+    for (const priority of priorities) {
+      const queue = this.priorityQueues.get(priority);
+      if (queue && queue.length > 0) {
+        return queue.shift()!;
+      }
+    }
+    
+    return null;
+  }
+
+  // Dead letter queue management
+  private moveToDeadLetterQueue(jobId: string): void {
+    const job = this.jobs.get(jobId);
+    if (!job) return;
+
+    job.status = 'dead_letter';
+    job.completedAt = Date.now();
+    
+    // Remove from all queues
+    this.removeFromPriorityQueue(jobId, job.priority);
+    const retryIndex = this.retryQueue.indexOf(jobId);
+    if (retryIndex > -1) {
+      this.retryQueue.splice(retryIndex, 1);
+    }
+    
+    // Add to dead letter queue
+    this.deadLetterQueue.push(jobId);
+    
+    console.warn(`Job ${jobId} moved to dead letter queue after ${job.attempts} attempts`);
+  }
+
+  // Batch optimization
+  private groupSimilarRequests(requests: BatchLookupRequest[]): Map<string, BatchLookupRequest[]> {
+    const groups = new Map<string, BatchLookupRequest[]>();
+    
+    for (const request of requests) {
+      // Group by pathname and similar query patterns
+      const key = `${request.pathname}:${this.getQueryPattern(request.query)}`;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)!.push(request);
+    }
+    
+    return groups;
+  }
+
+  private getQueryPattern(query: QueryParams): string {
+    // Create a pattern based on query type for grouping
+    if (query.lat !== undefined && query.lon !== undefined) {
+      return 'coordinates';
+    } else if (query.postal) {
+      return 'postal';
+    } else if (query.address) {
+      return 'address';
+    } else {
+      return 'mixed';
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -113,6 +214,10 @@ export class QueueManager {
           return await this.handleProcessJobs(request);
         case '/queue/health':
           return await this.handleHealthCheck();
+        case '/queue/dead-letter':
+          return await this.handleDeadLetterQueue(request);
+        case '/queue/retry-dead-letter':
+          return await this.handleRetryDeadLetterJobs(request);
         default:
           return new Response('Not found', { status: 404 });
       }
@@ -130,8 +235,8 @@ export class QueueManager {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    const body = await request.json();
-    const { requests } = body;
+    const body = await request.json() as { requests: BatchLookupRequest[]; priority?: number; tags?: string[] };
+    const { requests, priority = 1, tags = [] } = body;
 
     if (!Array.isArray(requests) || requests.length === 0) {
       return new Response(JSON.stringify({ error: 'Invalid requests array' }), {
@@ -152,29 +257,37 @@ export class QueueManager {
       errors: []
     };
 
-    // Create individual jobs
+    // Group similar requests for optimization
+    const groupedRequests = this.groupSimilarRequests(requests);
     const jobIds: string[] = [];
-    for (let i = 0; i < requests.length; i++) {
-      const req = requests[i];
-      const jobId = `${batchId}_job_${i}`;
-      
-      const job: QueueJob = {
-        id: jobId,
-        batchId,
-        request: {
-          id: req.id || `req_${i}`,
-          query: req.query,
-          pathname: req.pathname
-        },
-        status: 'pending',
-        attempts: 0,
-        maxAttempts: 5, // Configurable
-        createdAt: Date.now()
-      };
+    let jobIndex = 0;
 
-      this.jobs.set(jobId, job);
-      this.processingQueue.push(jobId);
-      jobIds.push(jobId);
+    for (const [groupKey, groupRequests] of groupedRequests) {
+      for (const req of groupRequests) {
+        const jobId = `${batchId}_job_${jobIndex}`;
+        
+        const job: QueueJob = {
+          id: jobId,
+          batchId,
+          request: {
+            id: req.id || `req_${jobIndex}`,
+            query: req.query,
+            pathname: req.pathname
+          },
+          status: 'pending',
+          priority: priority,
+          attempts: 0,
+          maxAttempts: 5, // Configurable
+          createdAt: Date.now(),
+          errorCount: 0,
+          tags: [...tags, groupKey] // Add group key as tag
+        };
+
+        this.jobs.set(jobId, job);
+        this.addToPriorityQueue(jobId, priority);
+        jobIds.push(jobId);
+        jobIndex++;
+      }
     }
 
     this.batches.set(batchId, batchJob);
@@ -183,8 +296,9 @@ export class QueueManager {
     return new Response(JSON.stringify({
       batchId,
       totalJobs: requests.length,
+      groupedJobs: groupedRequests.size,
       status: 'submitted',
-      message: 'Batch submitted successfully'
+      message: 'Batch submitted successfully with optimization'
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -289,7 +403,7 @@ export class QueueManager {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    const body = await request.json();
+    const body = await request.json() as { jobIds: string[] };
     const { jobIds } = body;
 
     if (!Array.isArray(jobIds)) {
@@ -327,11 +441,24 @@ export class QueueManager {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    const body = await request.json();
-    const { maxJobs = 10 } = body;
+    const body = await request.json() as { maxJobs?: number; priority?: number | null };
+    const { maxJobs = 10, priority = null } = body;
 
-    const jobsToProcess = this.processingQueue.splice(0, maxJobs);
-    const results = [];
+    const jobsToProcess: string[] = [];
+    
+    // Process retry queue first
+    const retryJobs = this.retryQueue.splice(0, Math.min(maxJobs, this.retryQueue.length));
+    jobsToProcess.push(...retryJobs);
+    
+    // Then process priority queues
+    const remainingSlots = maxJobs - jobsToProcess.length;
+    if (remainingSlots > 0) {
+      const priorityJobs = this.getJobsFromPriorityQueues(remainingSlots, priority);
+      jobsToProcess.push(...priorityJobs);
+    }
+
+    const results: Array<{ jobId: string; status: string; result?: BatchLookupResponse; processingTime?: number; error?: string; attempts?: number }> = [];
+    const startTime = Date.now();
 
     for (const jobId of jobsToProcess) {
       const job = this.jobs.get(jobId);
@@ -350,6 +477,7 @@ export class QueueManager {
         job.completedAt = Date.now();
         job.result = result;
         job.processingTime = job.completedAt - job.startedAt!;
+        job.errorCount = 0; // Reset error count on success
 
         // Update batch
         const batch = this.batches.get(job.batchId);
@@ -362,10 +490,10 @@ export class QueueManager {
           }
         }
 
-        results.push({ jobId, status: 'completed', result });
+        results.push({ jobId, status: 'completed', result, processingTime: job.processingTime });
       } catch (error) {
-        job.status = 'failed';
-        job.error = error.message;
+        job.errorCount++;
+        job.lastError = error.message;
         job.completedAt = Date.now();
 
         // Check if we should retry
@@ -375,7 +503,7 @@ export class QueueManager {
           this.retryQueue.push(jobId);
         } else {
           // Move to dead letter queue
-          this.deadLetterQueue.push(jobId);
+          this.moveToDeadLetterQueue(jobId);
         }
 
         // Update batch
@@ -389,18 +517,66 @@ export class QueueManager {
           }
         }
 
-        results.push({ jobId, status: 'failed', error: error.message });
+        results.push({ jobId, status: 'failed', error: error.message, attempts: job.attempts });
       }
     }
+
+    // Update throughput metrics
+    const processingTime = Date.now() - startTime;
+    this.processedJobsCount += results.length;
+    this.lastProcessedTime = Date.now();
 
     this.updateStats();
 
     return new Response(JSON.stringify({
       processedJobs: results.length,
-      results
+      processingTime,
+      results,
+      queueStats: {
+        pendingJobs: this.getTotalPendingJobs(),
+        retryQueueSize: this.retryQueue.length,
+        deadLetterQueueSize: this.deadLetterQueue.length
+      }
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
+  }
+
+  private getJobsFromPriorityQueues(maxJobs: number, specificPriority: number | null = null): string[] {
+    const jobs: string[] = [];
+    
+    if (specificPriority !== null) {
+      // Get jobs from specific priority queue
+      const queue = this.priorityQueues.get(specificPriority);
+      if (queue) {
+        const availableJobs = queue.splice(0, maxJobs);
+        jobs.push(...availableJobs);
+      }
+    } else {
+      // Get jobs from all priority queues in order
+      const priorities = Array.from(this.priorityQueues.keys()).sort((a, b) => b - a);
+      
+      for (const priority of priorities) {
+        if (jobs.length >= maxJobs) break;
+        
+        const queue = this.priorityQueues.get(priority);
+        if (queue && queue.length > 0) {
+          const remainingSlots = maxJobs - jobs.length;
+          const availableJobs = queue.splice(0, remainingSlots);
+          jobs.push(...availableJobs);
+        }
+      }
+    }
+    
+    return jobs;
+  }
+
+  private getTotalPendingJobs(): number {
+    let total = 0;
+    for (const queue of this.priorityQueues.values()) {
+      total += queue.length;
+    }
+    return total;
   }
 
   private async handleHealthCheck(): Promise<Response> {
@@ -449,10 +625,24 @@ export class QueueManager {
     let deadLetterJobs = 0;
     let totalProcessingTime = 0;
     let completedCount = 0;
+    let errorCount = 0;
+    const priorityDistribution: Record<number, number> = {};
+    let oldestPendingJob = Date.now();
 
     for (const job of this.jobs.values()) {
       totalJobs++;
       totalProcessingTime += job.processingTime || 0;
+      
+      // Track priority distribution
+      if (job.status === 'pending' || job.status === 'processing') {
+        priorityDistribution[job.priority] = (priorityDistribution[job.priority] || 0) + 1;
+        if (job.createdAt < oldestPendingJob) {
+          oldestPendingJob = job.createdAt;
+        }
+      }
+      
+      // Count errors
+      errorCount += job.errorCount || 0;
       
       switch (job.status) {
         case 'pending':
@@ -471,10 +661,16 @@ export class QueueManager {
         case 'retrying':
           retryingJobs++;
           break;
+        case 'dead_letter':
+          deadLetterJobs++;
+          break;
       }
     }
 
-    deadLetterJobs = this.deadLetterQueue.length;
+    // Calculate throughput (jobs per minute)
+    const timeSinceLastProcessed = Date.now() - this.lastProcessedTime;
+    const throughput = timeSinceLastProcessed > 0 ? 
+      (this.processedJobsCount * 60000) / timeSinceLastProcessed : 0;
 
     this.stats = {
       totalJobs,
@@ -485,8 +681,112 @@ export class QueueManager {
       retryingJobs,
       deadLetterJobs,
       averageProcessingTime: completedCount > 0 ? totalProcessingTime / completedCount : 0,
-      successRate: totalJobs > 0 ? (completedJobs / totalJobs) * 100 : 0
+      successRate: totalJobs > 0 ? (completedJobs / totalJobs) * 100 : 0,
+      priorityDistribution,
+      errorRate: totalJobs > 0 ? (errorCount / totalJobs) * 100 : 0,
+      throughput,
+      oldestPendingJob: oldestPendingJob === Date.now() ? 0 : Date.now() - oldestPendingJob,
+      deadLetterQueueSize: this.deadLetterQueue.length,
+      retryQueueSize: this.retryQueue.length
     };
+  }
+
+  private async handleDeadLetterQueue(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const offset = parseInt(url.searchParams.get('offset') || '0');
+
+    const deadLetterJobs = this.deadLetterQueue
+      .slice(offset, offset + limit)
+      .map(jobId => {
+        const job = this.jobs.get(jobId);
+        if (!job) return null;
+        
+        return {
+          id: job.id,
+          batchId: job.batchId,
+          priority: job.priority,
+          attempts: job.attempts,
+          createdAt: job.createdAt,
+          completedAt: job.completedAt,
+          lastError: job.lastError,
+          errorCount: job.errorCount,
+          tags: job.tags,
+          request: job.request
+        };
+      })
+      .filter(Boolean);
+
+    return new Response(JSON.stringify({
+      deadLetterJobs,
+      total: this.deadLetterQueue.length,
+      limit,
+      offset
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  private async handleRetryDeadLetterJobs(request: Request): Promise<Response> {
+    if (request.method !== 'POST') {
+      return new Response('Method not allowed', { status: 405 });
+    }
+
+    const body = await request.json() as { jobIds: string[]; resetAttempts?: boolean; newPriority?: number | null };
+    const { jobIds, resetAttempts = true, newPriority = null } = body;
+
+    if (!Array.isArray(jobIds)) {
+      return new Response(JSON.stringify({ error: 'Invalid jobIds array' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    let retriedCount = 0;
+    const results: Array<{ jobId: string; status: string; priority?: number }> = [];
+
+    for (const jobId of jobIds) {
+      const job = this.jobs.get(jobId);
+      if (job && job.status === 'dead_letter') {
+        // Reset job status
+        job.status = 'pending';
+        if (resetAttempts) {
+          job.attempts = 0;
+          job.errorCount = 0;
+        }
+        job.lastError = undefined;
+        job.nextRetryAt = undefined;
+        
+        // Update priority if specified
+        if (newPriority !== null) {
+          job.priority = newPriority;
+        }
+        
+        // Remove from dead letter queue
+        const deadLetterIndex = this.deadLetterQueue.indexOf(jobId);
+        if (deadLetterIndex > -1) {
+          this.deadLetterQueue.splice(deadLetterIndex, 1);
+        }
+        
+        // Add back to priority queue
+        this.addToPriorityQueue(jobId, job.priority);
+        
+        retriedCount++;
+        results.push({ jobId, status: 'retried', priority: job.priority });
+      } else {
+        results.push({ jobId, status: 'not_found_or_not_dead_letter' });
+      }
+    }
+
+    this.updateStats();
+
+    return new Response(JSON.stringify({
+      message: `Retried ${retriedCount} dead letter jobs`,
+      retriedCount,
+      results
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 

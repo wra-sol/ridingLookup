@@ -1,315 +1,227 @@
 /// <reference types="@cloudflare/workers-types" />
 
-export interface Env {
-  RIDINGS: R2Bucket;
-  GEOCODER?: string;
-  MAPBOX_TOKEN?: string;
-  GOOGLE_MAPS_KEY?: string;
-  BASIC_AUTH?: string;
-  BATCH_QUEUE?: DurableObjectNamespace;
-  QUEUE_MANAGER?: DurableObjectNamespace;
-  BATCH_SIZE?: number;
-  BATCH_TIMEOUT?: number;
-  RATE_LIMIT?: number;
-}
+import { Env, QueryParams, LookupResult, GeoJSONFeatureCollection, SpatialIndex } from './types';
+import { geocodeIfNeeded, geocodeBatch } from './geocoding';
+import { 
+  geoCacheLRU, 
+  spatialIndexCacheLRU, 
+  geoCache,
+  spatialIndexCache,
+  getCachedGeoJSON, 
+  setCachedGeoJSON, 
+  getCachedSpatialIndex, 
+  setCachedSpatialIndex,
+  getCachedSimplifiedBoundary,
+  setCachedSimplifiedBoundary,
+  initializeCacheWarming,
+  getCacheWarmingStatus
+} from './cache';
+import { geocodingCircuitBreaker, r2CircuitBreaker } from './circuit-breaker';
+import { incrementMetric, recordTiming, getMetrics, getMetricsSummary } from './metrics';
+import { 
+  isPointInPolygon, 
+  withTimeout, 
+  withRetry, 
+  pickDataset, 
+  parseQuery, 
+  checkBasicAuth, 
+  badRequest, 
+  unauthorizedResponse, 
+  rateLimitExceededResponse,
+  checkRateLimit,
+  getClientId,
+  simplifyGeometry
+} from './utils';
+import { 
+  createSpatialIndex, 
+  findCandidateFeatures, 
+  isPointInBoundingBox,
+  queryRidingFromDatabase,
+  initializeSpatialDatabase,
+  insertFeaturesIntoDatabase,
+  getAllFeaturesFromDatabase,
+  syncGeoJSONToDatabase,
+  SPATIAL_DB_CONFIG
+} from './spatial';
+import { 
+  initializeWebhookProcessing, 
+  triggerBatchCompletionWebhook,
+  getAllWebhooks,
+  getWebhookEvents,
+  getWebhookDeliveries,
+  generateWebhookId,
+  createWebhook,
+  updateWebhook,
+  deleteWebhook,
+  getWebhook
+} from './webhooks';
+import { 
+  processBatchLookup, 
+  processBatchLookupWithBatchGeocoding,
+  submitBatchToQueue,
+  getBatchStatus,
+  processQueueJobs,
+  BATCH_CONFIG
+} from './batch';
+import { QueueManagerDO } from './queue-manager';
+import { createLandingPage, createSwaggerUI, createOpenAPISpec } from './docs';
 
-interface MapboxFeature {
-  center: [number, number];
-}
-
-interface MapboxResponse {
-  features: MapboxFeature[];
-}
-
-interface NominatimResult {
-  lon: string;
-  lat: string;
-}
-
-interface GeoJSONGeometry {
-  type: "Polygon" | "MultiPolygon";
-  coordinates: number[][][] | number[][][][];
-}
-
-interface GeoJSONFeature {
-  type: "Feature";
-  geometry: GeoJSONGeometry;
-  properties: Record<string, unknown>;
-}
-
-interface GeoJSONFeatureCollection {
-  type: "FeatureCollection";
-  features: GeoJSONFeature[];
-}
-
-interface QueryParams {
-  address?: string;
-  postal?: string;
-  lat?: number;
-  lon?: number;
-  city?: string;
-  state?: string; // province/state
-  country?: string;
-}
-
-interface LookupResult {
-  properties: Record<string, unknown> | null;
-}
-
-interface BatchLookupRequest {
-  id: string;
-  query: QueryParams;
-  pathname: string;
-}
-
-interface BatchLookupResponse {
-  id: string;
-  query: QueryParams;
-  point?: { lon: number; lat: number };
-  properties: Record<string, unknown> | null;
-  error?: string;
-  processingTime: number;
-}
-
-interface BatchJob {
-  id: string;
-  requests: BatchLookupRequest[];
-  status: 'pending' | 'processing' | 'completed' | 'failed';
-  createdAt: number;
-  completedAt?: number;
-  results: BatchLookupResponse[];
-  errors: string[];
-}
-
-interface TimeoutConfig {
-  geocoding: number;
-  lookup: number;
-  batch: number;
-  total: number;
-}
-
-// Minimal Google Geocoding API response types we use
-interface GoogleGeocodeLocation { lat: number; lng: number }
-interface GoogleGeocodeGeometry { location: GoogleGeocodeLocation }
-interface GoogleGeocodeResult { geometry: GoogleGeocodeGeometry }
-interface GoogleGeocodeResponse { status: string; results: GoogleGeocodeResult[] }
-
-// Simple point-in-polygon test using ray casting.
-// Supports Polygon and MultiPolygon GeoJSON geometries.
-function isPointInPolygon(lon: number, lat: number, geometry: GeoJSONGeometry): boolean {
-  const point = [lon, lat];
-  const type = geometry?.type;
-  const coords = geometry?.coordinates;
-  if (!type || !coords) return false;
-
-  if (type === "Polygon") {
-    return polygonContains(point, coords as number[][][]);
-  }
-  if (type === "MultiPolygon") {
-    for (const poly of coords) {
-      if (polygonContains(point, poly as number[][][])) return true;
-    }
-    return false;
-  }
-  return false;
-}
-
-function polygonContains(point: number[], polygon: number[][][]): boolean {
-  // polygon: [ [ [lon,lat], ... ] outerRing, hole1, hole2, ... ]
-  if (!Array.isArray(polygon) || polygon.length === 0) return false;
-  // Must be inside outer ring and outside holes
-  if (!ringContains(point, polygon[0] as number[][])) return false;
-  for (let i = 1; i < polygon.length; i++) {
-    if (ringContains(point, polygon[i])) return false; // inside a hole
-  }
-  return true;
-}
-
-function ringContains(point: number[], ring: number[][]): boolean {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const xi = ring[i][0], yi = ring[i][1];
-    const xj = ring[j][0], yj = ring[j][1];
-    const intersect = ((yi > point[1]) !== (yj > point[1])) &&
-      (point[0] < (xj - xi) * (point[1] - yi) / (yj - yi + 0.0) + xi);
-    if (intersect) inside = !inside;
-  }
-  return inside;
-}
-
-// Minimal in-memory cache of parsed FeatureCollections by key
-const geoCache: Map<string, GeoJSONFeatureCollection> = new Map();
-
-// Timeout configuration (in milliseconds)
-const DEFAULT_TIMEOUTS: TimeoutConfig = {
-  geocoding: 10000,  // 10 seconds for geocoding
-  lookup: 5000,      // 5 seconds for riding lookup
-  batch: 30000,      // 30 seconds for batch processing
-  total: 60000       // 60 seconds total request timeout
+// Configuration constants
+const DEFAULT_TIMEOUTS = {
+  geocoding: 10000,
+  lookup: 5000,
+  batch: 30000,
+  total: 60000
 };
 
-// Rate limiting configuration
-const DEFAULT_RATE_LIMIT = 100; // requests per minute
-const DEFAULT_BATCH_SIZE = 50;  // max requests per batch
+const DEFAULT_RETRY_CONFIG = {
+  maxAttempts: 3,
+  baseDelay: 1000,
+  maxDelay: 5000,
+  backoffMultiplier: 2,
+  jitter: true
+};
 
-// Rate limiting storage
-const rateLimitStore: Map<string, { count: number; resetTime: number }> = new Map();
+// Global state
+let cacheWarmingInitialized = false;
 
-// Timeout wrapper function
-async function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  operation: string
-): Promise<T> {
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)), timeoutMs);
-  });
+// Main lookup function
+async function lookupRiding(env: Env, pathname: string, lon: number, lat: number): Promise<LookupResult> {
+  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup;
   
-  return Promise.race([promise, timeoutPromise]);
-}
-
-// Rate limiting check
-function checkRateLimit(env: Env, clientId: string): boolean {
-  const rateLimit = env.RATE_LIMIT || DEFAULT_RATE_LIMIT;
-  const now = Date.now();
-  const windowMs = 60 * 1000; // 1 minute window
-  
-  const current = rateLimitStore.get(clientId);
-  if (!current || now > current.resetTime) {
-    rateLimitStore.set(clientId, { count: 1, resetTime: now + windowMs });
-    return true;
-  }
-  
-  if (current.count >= rateLimit) {
-    return false;
-  }
-  
-  current.count++;
-  return true;
-}
-
-// Get client identifier for rate limiting
-function getClientId(request: Request): string {
-  // Use IP address or API key for rate limiting
-  const apiKey = request.headers.get("X-Google-API-Key");
-  if (apiKey) return `api:${apiKey}`;
-  
-  const cfConnectingIp = request.headers.get("CF-Connecting-IP");
-  const xForwardedFor = request.headers.get("X-Forwarded-For");
-  const ip = cfConnectingIp || xForwardedFor?.split(',')[0] || "unknown";
-  return `ip:${ip}`;
-}
-
-async function loadGeo(env: Env, key: string): Promise<GeoJSONFeatureCollection> {
-  const cached = geoCache.get(key);
-  if (cached) return cached;
-  const obj = await env.RIDINGS.get(key);
-  if (!obj) throw new Error(`GeoJSON not found in R2: ${key}`);
-  const text = await obj.text();
-  const json = JSON.parse(text);
-  // Basic shape check
-  if (!json || json.type !== "FeatureCollection" || !Array.isArray(json.features)) {
-    throw new Error(`Invalid GeoJSON FeatureCollection: ${key}`);
-  }
-  geoCache.set(key, json);
-  return json;
-}
-
-function pickDataset(pathname: string): { r2Key: string } {
-  // Map routes to R2 object keys
-  if (pathname === "/api/qc") return { r2Key: "quebecridings-2025.geojson" };
-  if (pathname === "/api/on") return { r2Key: "ontarioridings-2022.geojson" };
-  // default federal
-  return { r2Key: "federalridings-2024.geojson" };
-}
-
-function parseQuery(request: Request) {
-  const url = new URL(request.url);
-  const q = url.searchParams;
-  const address = q.get("address") || undefined;
-  const postal = q.get("postal") || q.get("postal_code") || undefined;
-  const city = q.get("city") || undefined;
-  const state = q.get("state") || q.get("province") || undefined;
-  const country = q.get("country") || undefined;
-  const latStr = q.get("lat");
-  const lonStr = q.get("lon") || q.get("lng") || q.get("long");
-  const lat = latStr ? Number(latStr) : undefined;
-  const lon = lonStr ? Number(lonStr) : undefined;
-  return { address, postal, city, state, country, lat, lon };
-}
-
-async function geocodeIfNeeded(env: Env, qp: QueryParams, request?: Request): Promise<{ lon: number; lat: number; }> {
-  if (typeof qp.lat === "number" && typeof qp.lon === "number") {
-    return { lon: qp.lon, lat: qp.lat };
-  }
-  const query = qp.address || qp.postal || qp.city || qp.state || qp.country;
-  if (!query) throw new Error("Missing location: provide lat/lon or address/postal");
-
-  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.geocoding;
-  
-  const geocodePromise = (async () => {
-    const provider = (env.GEOCODER || "nominatim").toLowerCase();
-    if (provider === "google") {
-      // Check for Google API key in header first, then fall back to environment variable
-      const headerKey = request?.headers.get("X-Google-API-Key");
-      const key = headerKey || env.GOOGLE_MAPS_KEY;
-      if (!key) throw new Error("Google API key not provided. Set X-Google-API-Key header or configure GOOGLE_MAPS_KEY environment variable");
-      const params = new URLSearchParams({ key });
-      // Prefer structured components when available
-      const components: string[] = [];
-      if (qp.postal) components.push(`postal_code:${qp.postal}`);
-      if (qp.city) components.push(`locality:${qp.city}`);
-      if (qp.state) components.push(`administrative_area:${qp.state}`);
-      if (qp.country) components.push(`country:${qp.country}`);
-      if (components.length) params.set("components", components.join("|"));
-      if (qp.address) params.set("address", qp.address);
-
-      const url = `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`;
-      const resp = await fetch(url, { headers: { "User-Agent": "riding-lookup/1.0" } });
-      if (!resp.ok) throw new Error(`Google error: ${resp.status}`);
-      const data = await resp.json() as GoogleGeocodeResponse;
-      if (data.status !== "OK" || !data.results?.length) throw new Error("No results from Google");
-      const loc = data.results[0].geometry.location;
-      return { lon: loc.lng, lat: loc.lat };
+  const lookupPromise = (async () => {
+    const { r2Key } = pickDataset(pathname);
+    
+    // Try spatial database first if enabled
+    if (SPATIAL_DB_CONFIG.ENABLED && env.RIDING_DB) {
+      try {
+        const dbResult = await queryRidingFromDatabase(env, r2Key, lon, lat);
+        if (dbResult) {
+          return {
+            riding: dbResult.properties?.ENGLISH_NAME || dbResult.properties?.NAME_EN || 'Unknown',
+            properties: dbResult.properties || {},
+            source: 'database'
+          };
+        }
+      } catch (error) {
+        console.warn('Database lookup failed, falling back to spatial index:', error);
+      }
     }
-    if (provider === "mapbox") {
-      const token = env.MAPBOX_TOKEN;
-      if (!token) throw new Error("MAPBOX_TOKEN not configured");
-      const resp = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?limit=1&proximity=ca&access_token=${token}`, {
-        headers: { "User-Agent": "riding-lookup/1.0" }
-      });
-      if (!resp.ok) throw new Error(`Mapbox error: ${resp.status}`);
-      const data = await resp.json() as MapboxResponse;
-      const feat = data?.features?.[0];
-      if (!feat?.center) throw new Error("No results from Mapbox");
-      return { lon: feat.center[0], lat: feat.center[1] };
+    
+    // Check LRU cache first
+    let spatialIndex = spatialIndexCacheLRU.get(r2Key);
+    if (!spatialIndex) {
+      // Fallback to old cache
+      spatialIndex = spatialIndexCache.get(r2Key);
+      if (spatialIndex) {
+        spatialIndexCacheLRU.set(r2Key, spatialIndex);
+      }
     }
-
-    // Default to Nominatim (OpenStreetMap)
-    const nominatimParams = new URLSearchParams({ format: "jsonv2", limit: "1", country: "canada" });
-    if (qp.address) nominatimParams.set("street", qp.address);
-    if (qp.city) nominatimParams.set("city", qp.city);
-    if (qp.state) nominatimParams.set("state", qp.state);
-    if (qp.country) nominatimParams.set("country", qp.country);
-    if (qp.postal) nominatimParams.set("postalcode", qp.postal);
-    // Fallback free-form
-    if (![qp.address, qp.city, qp.state, qp.country, qp.postal].some(Boolean)) {
-      nominatimParams.set("q", query);
+    
+    if (!spatialIndex) {
+        // Load GeoJSON to create spatial index
+        await loadGeo(env, r2Key);
+        spatialIndex = spatialIndexCacheLRU.get(r2Key) || spatialIndexCache.get(r2Key);
+        if (!spatialIndex) throw new Error(`Failed to create spatial index for ${r2Key}`);
     }
-    console.log(nominatimParams.toString());
-    const nominatimUrl = `https://nominatim.openstreetmap.org/search?${nominatimParams.toString()}`;
-    const resp = await fetch(nominatimUrl, { headers: { "User-Agent": "riding-lookup/1.0" } });
-    if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
-    const results = await resp.json() as NominatimResult[];
-    const first = results?.[0];
-    if (!first) throw new Error("No results from Nominatim");
-    return { lon: Number(first.lon), lat: Number(first.lat) };
+    
+    return lookupRidingWithIndex(spatialIndex, lon, lat);
   })();
 
-  return withTimeout(geocodePromise, timeoutMs, "Geocoding");
+  return withTimeout(lookupPromise, timeoutMs, "Riding lookup");
 }
 
-function featurePropertiesIfContains(ridingFeature: GeoJSONFeature, lon: number, lat: number): Record<string, unknown> | null {
+// Load GeoJSON data from R2
+async function loadGeo(env: Env, key: string): Promise<GeoJSONFeatureCollection> {
+  const startTime = Date.now();
+  incrementMetric('r2Requests');
+  
+  // Check LRU cache first
+  const cached = geoCacheLRU.get(key);
+  if (cached) {
+    incrementMetric('r2CacheHits');
+    recordTiming('totalR2Time', Date.now() - startTime);
+    return cached;
+  }
+
+  // Fallback to old cache
+  const oldCached = geoCache.get(key);
+  if (oldCached) {
+    incrementMetric('r2CacheHits');
+    geoCacheLRU.set(key, oldCached);
+    recordTiming('totalR2Time', Date.now() - startTime);
+    return oldCached;
+  }
+
+  incrementMetric('r2CacheMisses');
+  
+  try {
+    const geo = await r2CircuitBreaker.execute(`r2:${key}`, async () => {
+      return await withRetry(async () => {
+        const obj = await env.RIDINGS.get(key);
+        if (!obj) throw new Error(`R2 object not found: ${key}`);
+        const text = await obj.text();
+        return JSON.parse(text) as GeoJSONFeatureCollection;
+      }, DEFAULT_RETRY_CONFIG, `R2 fetch ${key}`);
+    });
+    
+    // Cache the result
+    setCachedGeoJSON(key, geo);
+    
+    // Create spatial index
+    const spatialIndex = createSpatialIndex(geo);
+    setCachedSpatialIndex(key, spatialIndex);
+    
+    incrementMetric('r2Successes');
+    recordTiming('totalR2Time', Date.now() - startTime);
+    return geo;
+  } catch (error) {
+    incrementMetric('r2Failures');
+    if (error instanceof Error && error.message.includes('Circuit breaker is OPEN')) {
+      incrementMetric('r2CircuitBreakerTrips');
+    }
+    recordTiming('totalR2Time', Date.now() - startTime);
+    throw error;
+  }
+}
+
+// Lookup riding using spatial index
+function lookupRidingWithIndex(spatialIndex: SpatialIndex, lon: number, lat: number): LookupResult {
+  const startTime = Date.now();
+  
+  // First check if point is within the overall bounding box
+  if (!isPointInBoundingBox(lon, lat, spatialIndex.boundingBox)) {
+    incrementMetric('spatialIndexHits');
+    recordTiming('totalSpatialIndexTime', Date.now() - startTime);
+    return { properties: null };
+  }
+  
+  // Find candidate features using spatial index
+  const candidates = findCandidateFeatures(lon, lat, spatialIndex);
+  
+  if (candidates.length === 0) {
+    incrementMetric('spatialIndexHits');
+    recordTiming('totalSpatialIndexTime', Date.now() - startTime);
+    return { properties: null };
+  }
+  
+  incrementMetric('spatialIndexMisses');
+  
+  // Only test point-in-polygon for candidates
+  for (const feat of candidates) {
+    const props = featurePropertiesIfContains(feat, lon, lat);
+    if (props) {
+      recordTiming('totalSpatialIndexTime', Date.now() - startTime);
+      return { properties: props };
+    }
+  }
+  
+  recordTiming('totalSpatialIndexTime', Date.now() - startTime);
+  return { properties: null };
+}
+
+// Check if point is in polygon and return properties
+function featurePropertiesIfContains(ridingFeature: any, lon: number, lat: number): Record<string, unknown> | null {
   const geom = ridingFeature?.geometry;
   if (!geom) return null;
   if (isPointInPolygon(lon, lat, geom)) {
@@ -318,1184 +230,50 @@ function featurePropertiesIfContains(ridingFeature: GeoJSONFeature, lon: number,
   return null;
 }
 
-async function lookupRiding(env: Env, pathname: string, lon: number, lat: number): Promise<LookupResult> {
-  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup;
-  
-  const lookupPromise = (async () => {
-    const { r2Key } = pickDataset(pathname);
-    const fc = await loadGeo(env, r2Key);
-    for (const feat of fc.features) {
-      const props = featurePropertiesIfContains(feat, lon, lat);
-      if (props) return { properties: props };
-    }
-    return { properties: null };
-  })();
-
-  return withTimeout(lookupPromise, timeoutMs, "Riding lookup");
-}
-
-function badRequest(message: string, status = 400) {
-  return new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "content-type": "application/json; charset=UTF-8" }
-  });
-}
-
-function checkBasicAuth(request: Request, env: Env): boolean {
-  // If BASIC_AUTH is not configured, skip authentication
-  if (!env.BASIC_AUTH) return true;
-  
-  // If user provides their own Google API key, bypass basic auth
-  const googleApiKey = request.headers.get("X-Google-API-Key");
-  if (googleApiKey) return true;
-  
-  const authHeader = request.headers.get("Authorization");
-  if (!authHeader || !authHeader.startsWith("Basic ")) {
-    return false;
-  }
-  
-  try {
-    const encoded = authHeader.substring(6); // Remove "Basic " prefix
-    const decoded = atob(encoded);
-    return decoded === env.BASIC_AUTH;
-  } catch {
-    return false;
-  }
-}
-
-function unauthorizedResponse() {
-  return new Response(JSON.stringify({ error: "Unauthorized" }), {
-    status: 401,
-    headers: { 
-      "content-type": "application/json; charset=UTF-8",
-      "WWW-Authenticate": "Basic realm=\"Riding Lookup API\""
-    }
-  });
-}
-
-function rateLimitExceededResponse() {
-  return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
-    status: 429,
-    headers: { 
-      "content-type": "application/json; charset=UTF-8",
-      "Retry-After": "60"
-    }
-  });
-}
-
-// Queue processing functions
-async function processBatchLookup(env: Env, requests: BatchLookupRequest[]): Promise<BatchLookupResponse[]> {
-  const results: BatchLookupResponse[] = [];
-  const batchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
-  
-  // Process requests in chunks to avoid overwhelming the system
-  for (let i = 0; i < requests.length; i += batchSize) {
-    const chunk = requests.slice(i, i + batchSize);
-    const chunkPromises = chunk.map(async (req) => {
-      const startTime = Date.now();
-      try {
-        const { lon, lat } = await geocodeIfNeeded(env, req.query);
-        const result = await lookupRiding(env, req.pathname, lon, lat);
-        const processingTime = Date.now() - startTime;
-        
-        return {
-          id: req.id,
-          query: req.query,
-          point: { lon, lat },
-          properties: result.properties,
-          processingTime
-        } as BatchLookupResponse;
-      } catch (error) {
-        const processingTime = Date.now() - startTime;
-        return {
-          id: req.id,
-          query: req.query,
-          properties: null,
-          error: error instanceof Error ? error.message : "Unknown error",
-          processingTime
-        } as BatchLookupResponse;
-      }
-    });
-    
-    const chunkResults = await Promise.all(chunkPromises);
-    results.push(...chunkResults);
-  }
-  
-  return results;
-}
-
-// Queue-based batch processing using Durable Objects
-async function submitBatchToQueue(env: Env, requests: BatchLookupRequest[]): Promise<{ batchId: string; status: string }> {
-  if (!env.QUEUE_MANAGER) {
-    throw new Error("Queue manager not configured");
-  }
-
-  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
-  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
-  
-  const response = await queueManager.fetch(new Request("https://queue.local/queue/submit", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ requests })
-  }));
-
-  if (!response.ok) {
-    const error = await response.json() as { error?: string };
-    throw new Error(error.error || "Failed to submit batch to queue");
-  }
-
-  return await response.json();
-}
-
-async function getBatchStatus(env: Env, batchId: string): Promise<any> {
-  if (!env.QUEUE_MANAGER) {
-    throw new Error("Queue manager not configured");
-  }
-
-  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
-  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
-  
-  const response = await queueManager.fetch(new Request(`https://queue.local/queue/status?batchId=${batchId}`));
-  
-  if (!response.ok) {
-    const error = await response.json() as { error?: string };
-    throw new Error(error.error || "Failed to get batch status");
-  }
-
-  return await response.json();
-}
-
-async function processQueueJobs(env: Env, maxJobs: number = 10): Promise<any> {
-  if (!env.QUEUE_MANAGER) {
-    throw new Error("Queue manager not configured");
-  }
-
-  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
-  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
-  
-  const response = await queueManager.fetch(new Request("https://queue.local/queue/process", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ maxJobs })
-  }));
-  
-  if (!response.ok) {
-    const error = await response.json() as { error?: string };
-    throw new Error(error.error || "Failed to process queue jobs");
-  }
-
-  return await response.json();
-}
-
-async function getQueueStats(env: Env): Promise<any> {
-  if (!env.QUEUE_MANAGER) {
-    throw new Error("Queue manager not configured");
-  }
-
-  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
-  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
-  
-  const response = await queueManager.fetch(new Request("https://queue.local/queue/stats"));
-  
-  if (!response.ok) {
-    const error = await response.json() as { error?: string };
-    throw new Error(error.error || "Failed to get queue stats");
-  }
-
-  return await response.json();
-}
-
-// Generate unique batch job ID
-function generateBatchId(): string {
-  return `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
-// Validate batch request
-function validateBatchRequest(body: any): { valid: boolean; requests?: BatchLookupRequest[]; error?: string } {
-  if (!body || !Array.isArray(body.requests)) {
-    return { valid: false, error: "Invalid request format. Expected { requests: [...] }" };
-  }
-  
-  const requests: BatchLookupRequest[] = [];
-  const maxBatchSize = DEFAULT_BATCH_SIZE * 2; // Allow larger batches for batch endpoint
-  
-  if (body.requests.length > maxBatchSize) {
-    return { valid: false, error: `Too many requests. Maximum ${maxBatchSize} requests per batch.` };
-  }
-  
-  for (let i = 0; i < body.requests.length; i++) {
-    const req = body.requests[i];
-    if (!req || typeof req !== 'object') {
-      return { valid: false, error: `Invalid request at index ${i}. Expected object.` };
-    }
-    
-    if (!req.query || typeof req.query !== 'object') {
-      return { valid: false, error: `Invalid query at index ${i}. Expected object.` };
-    }
-    
-    if (!req.pathname || typeof req.pathname !== 'string') {
-      return { valid: false, error: `Invalid pathname at index ${i}. Expected string.` };
-    }
-    
-    if (!['/api', '/api/qc', '/api/on'].includes(req.pathname)) {
-      return { valid: false, error: `Invalid pathname at index ${i}. Must be one of: /api, /api/qc, /api/on` };
-    }
-    
-    requests.push({
-      id: req.id || `req_${i}`,
-      query: req.query,
-      pathname: req.pathname
-    });
-  }
-  
-  return { valid: true, requests };
-}
-
-function createOpenAPISpec(baseUrl: string) {
-  return {
-    openapi: "3.0.0",
-    info: {
-      title: "Riding Lookup API",
-      description: "Find Canadian federal, provincial, and territorial ridings by location. Supports multiple geocoding providers including Google Maps (BYOK), Mapbox, and Nominatim. Built on Cloudflare Workers for global edge performance.",
-      version: "1.0.0",
-      contact: {
-        name: "Riding Lookup API",
-        email: "support@example.com"
-      },
-      license: {
-        name: "MIT"
-      }
-    },
-    servers: [
-      {
-        url: baseUrl,
-        description: "Production server"
-      }
-    ],
-    security: [
-      {
-        "BasicAuth": []
-      },
-      {
-        "GoogleAPIKey": []
-      }
-    ],
-    components: {
-      securitySchemes: {
-        "BasicAuth": {
-          type: "http",
-          scheme: "basic",
-          description: "Basic authentication using username and password"
-        },
-        "GoogleAPIKey": {
-          type: "apiKey",
-          in: "header",
-          name: "X-Google-API-Key",
-          description: "Google Maps API key for BYOK (Bring Your Own Key) authentication. Bypasses basic auth and provides unlimited requests with enhanced geocoding accuracy."
-        }
-      }
-    },
-    paths: {
-      "/api": {
-        get: {
-          summary: "Lookup Federal Riding",
-          description: "Find the federal electoral district for any Canadian location. Supports geocoding via address, postal code, coordinates, or structured location components. Returns comprehensive riding information including district number, name, and administrative details.",
-          operationId: "lookupFederalRiding",
-          tags: ["Federal Ridings"],
-          parameters: [
-            {
-              name: "address",
-              in: "query",
-              description: "Full address to geocode",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "postal",
-              in: "query",
-              description: "Postal code",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "lat",
-              in: "query",
-              description: "Latitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "lon",
-              in: "query",
-              description: "Longitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "city",
-              in: "query",
-              description: "City name",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "state",
-              in: "query",
-              description: "Province or state",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "country",
-              in: "query",
-              description: "Country",
-              required: false,
-              schema: { type: "string" }
-            }
-          ],
-          responses: {
-            "200": {
-              description: "Successful lookup",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      query: { type: "object" },
-                      point: {
-                        type: "object",
-                        properties: {
-                          lon: { type: "number" },
-                          lat: { type: "number" }
-                        }
-                      },
-                      properties: { type: "object" }
-                    }
-                  }
-                }
-              }
-            },
-            "400": {
-              description: "Bad request",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      error: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/qc": {
-        get: {
-          summary: "Lookup Quebec riding",
-          description: "Find the Quebec provincial riding for a given location",
-          parameters: [
-            {
-              name: "address",
-              in: "query",
-              description: "Full address to geocode",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "postal",
-              in: "query",
-              description: "Postal code",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "lat",
-              in: "query",
-              description: "Latitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "lon",
-              in: "query",
-              description: "Longitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "city",
-              in: "query",
-              description: "City name",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "state",
-              in: "query",
-              description: "Province or state",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "country",
-              in: "query",
-              description: "Country",
-              required: false,
-              schema: { type: "string" }
-            }
-          ],
-          responses: {
-            "200": {
-              description: "Successful lookup",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      query: { type: "object" },
-                      point: {
-                        type: "object",
-                        properties: {
-                          lon: { type: "number" },
-                          lat: { type: "number" }
-                        }
-                      },
-                      properties: { type: "object" }
-                    }
-                  }
-                }
-              }
-            },
-            "400": {
-              description: "Bad request",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      error: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/on": {
-        get: {
-          summary: "Lookup Ontario riding",
-          description: "Find the Ontario provincial riding for a given location",
-          parameters: [
-            {
-              name: "address",
-              in: "query",
-              description: "Full address to geocode",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "postal",
-              in: "query",
-              description: "Postal code",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "lat",
-              in: "query",
-              description: "Latitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "lon",
-              in: "query",
-              description: "Longitude",
-              required: false,
-              schema: { type: "number", format: "float" }
-            },
-            {
-              name: "city",
-              in: "query",
-              description: "City name",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "state",
-              in: "query",
-              description: "Province or state",
-              required: false,
-              schema: { type: "string" }
-            },
-            {
-              name: "country",
-              in: "query",
-              description: "Country",
-              required: false,
-              schema: { type: "string" }
-            }
-          ],
-          responses: {
-            "200": {
-              description: "Successful lookup",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      query: { type: "object" },
-                      point: {
-                        type: "object",
-                        properties: {
-                          lon: { type: "number" },
-                          lat: { type: "number" }
-                        }
-                      },
-                      properties: { type: "object" }
-                    }
-                  }
-                }
-              }
-            },
-            "400": {
-              description: "Bad request",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      error: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/batch": {
-        post: {
-          summary: "Batch Riding Lookup (Immediate)",
-          description: "Process multiple riding lookups immediately in a single request. Supports up to 100 requests per batch with timeout protection and rate limiting.",
-          operationId: "batchLookup",
-          tags: ["Batch Operations"],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    requests: {
-                      type: "array",
-                      items: {
-                        type: "object",
-                        properties: {
-                          id: {
-                            type: "string",
-                            description: "Optional unique identifier for this request"
-                          },
-                          pathname: {
-                            type: "string",
-                            enum: ["/api", "/api/qc", "/api/on"],
-                            description: "API endpoint to use for lookup"
-                          },
-                          query: {
-                            type: "object",
-                            properties: {
-                              address: { type: "string" },
-                              postal: { type: "string" },
-                              lat: { type: "number" },
-                              lon: { type: "number" },
-                              city: { type: "string" },
-                              state: { type: "string" },
-                              country: { type: "string" }
-                            }
-                          }
-                        },
-                        required: ["pathname", "query"]
-                      },
-                      maxItems: 100
-                    }
-                  },
-                  required: ["requests"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "Batch processing completed",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      batchId: { type: "string" },
-                      totalRequests: { type: "number" },
-                      successfulRequests: { type: "number" },
-                      failedRequests: { type: "number" },
-                      totalProcessingTime: { type: "number" },
-                      results: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            id: { type: "string" },
-                            query: { type: "object" },
-                            point: {
-                              type: "object",
-                              properties: {
-                                lon: { type: "number" },
-                                lat: { type: "number" }
-                              }
-                            },
-                            properties: { type: "object" },
-                            error: { type: "string" },
-                            processingTime: { type: "number" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "400": {
-              description: "Bad request",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      error: { type: "string" }
-                    }
-                  }
-                }
-              }
-            },
-            "429": {
-              description: "Rate limit exceeded",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      error: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/queue/submit": {
-        post: {
-          summary: "Submit Batch to Queue",
-          description: "Submit a batch of riding lookups to the persistent queue for asynchronous processing. Returns immediately with batch ID for status tracking.",
-          operationId: "submitBatchToQueue",
-          tags: ["Queue Operations"],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    requests: {
-                      type: "array",
-                      items: {
-                        type: "object",
-                        properties: {
-                          id: { type: "string" },
-                          pathname: { type: "string", enum: ["/api", "/api/qc", "/api/on"] },
-                          query: { type: "object" }
-                        },
-                        required: ["pathname", "query"]
-                      }
-                    }
-                  },
-                  required: ["requests"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "Batch submitted successfully",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      batchId: { type: "string" },
-                      totalJobs: { type: "number" },
-                      status: { type: "string" },
-                      message: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/queue/status": {
-        get: {
-          summary: "Get Batch Status",
-          description: "Check the status of a submitted batch job including completion progress and results.",
-          operationId: "getBatchStatus",
-          tags: ["Queue Operations"],
-          parameters: [
-            {
-              name: "batchId",
-              in: "query",
-              required: true,
-              schema: { type: "string" }
-            }
-          ],
-          responses: {
-            "200": {
-              description: "Batch status retrieved",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      id: { type: "string" },
-                      status: { type: "string", enum: ["pending", "processing", "completed", "failed", "partially_completed"] },
-                      totalJobs: { type: "number" },
-                      completedJobs: { type: "number" },
-                      failedJobs: { type: "number" },
-                      createdAt: { type: "number" },
-                      completedAt: { type: "number" },
-                      results: { type: "array" },
-                      errors: { type: "array" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/queue/stats": {
-        get: {
-          summary: "Get Queue Statistics",
-          description: "Get comprehensive statistics about the queue including job counts, processing times, and success rates.",
-          operationId: "getQueueStats",
-          tags: ["Queue Operations"],
-          responses: {
-            "200": {
-              description: "Queue statistics retrieved",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      totalJobs: { type: "number" },
-                      pendingJobs: { type: "number" },
-                      processingJobs: { type: "number" },
-                      completedJobs: { type: "number" },
-                      failedJobs: { type: "number" },
-                      retryingJobs: { type: "number" },
-                      deadLetterJobs: { type: "number" },
-                      averageProcessingTime: { type: "number" },
-                      successRate: { type: "number" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/queue/process": {
-        post: {
-          summary: "Process Queue Jobs",
-          description: "Process pending jobs from the queue. This endpoint is typically called by worker processes.",
-          operationId: "processQueueJobs",
-          tags: ["Queue Operations"],
-          requestBody: {
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    maxJobs: { type: "number", default: 10 }
-                  }
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "Jobs processed successfully",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      processedJobs: { type: "number" },
-                      results: { type: "array" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/api/docs": {
-        get: {
-          summary: "OpenAPI documentation",
-          description: "Get the OpenAPI specification for this API",
-          responses: {
-            "200": {
-              description: "OpenAPI specification",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  };
-}
-
-function createLandingPage(baseUrl: string) {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Riding Lookup API</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f8f9fa;
-        }
-        .container {
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-        }
-        h2 {
-            color: #2c3e50;
-            margin-top: 30px;
-            margin-bottom: 15px;
-        }
-        .endpoint {
-            background: #f8f9fa;
-            border-left: 4px solid #3498db;
-            padding: 15px;
-            margin: 15px 0;
-            border-radius: 0 4px 4px 0;
-        }
-        .method {
-            background: #27ae60;
-            color: white;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 12px;
-            margin-right: 10px;
-        }
-        .url {
-            font-family: 'Monaco', 'Menlo', monospace;
-            background: #ecf0f1;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        .description {
-            margin-top: 10px;
-            color: #666;
-        }
-        .example {
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 15px;
-            border-radius: 4px;
-            margin: 10px 0;
-            font-family: 'Monaco', 'Menlo', monospace;
-            font-size: 14px;
-            overflow-x: auto;
-        }
-        .param {
-            margin: 5px 0;
-        }
-        .param-name {
-            font-weight: bold;
-            color: #e74c3c;
-            font-family: 'Monaco', 'Menlo', monospace;
-        }
-        .param-desc {
-            color: #666;
-            margin-left: 10px;
-        }
-        .auth-note {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            padding: 15px;
-            border-radius: 4px;
-            margin: 20px 0;
-        }
-        .byok-note {
-            background: #d1ecf1;
-            border: 1px solid #bee5eb;
-            padding: 15px;
-            border-radius: 4px;
-            margin: 20px 0;
-        }
-        .links {
-            margin-top: 30px;
-            text-align: center;
-        }
-        .links a {
-            display: inline-block;
-            background: #3498db;
-            color: white;
-            padding: 10px 20px;
-            text-decoration: none;
-            border-radius: 4px;
-            margin: 0 10px;
-            transition: background 0.3s;
-        }
-        .links a:hover {
-            background: #2980b9;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Riding Lookup API</h1>
-        <p>Find Canadian federal, provincial, and territorial ridings by location. This API supports geocoding addresses, postal codes, and coordinates to determine which riding a location falls within.</p>
-        
-        <div class="auth-note">
-            <strong>Authentication:</strong> This API uses Basic Authentication. Include your credentials in the Authorization header, or provide your own Google API key via the X-Google-API-Key header to bypass authentication.
-        </div>
-
-        <div class="byok-note">
-            <strong>Rate Limiting & Timeouts:</strong> The API includes rate limiting (100 requests/minute by default) and timeout protection. Single lookups timeout after 10s for geocoding and 5s for riding lookup. Batch operations timeout after 30s total. All operations have a 60s maximum request timeout.
-        </div>
-
-        <h2>API Endpoints</h2>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api</span>
-            <div class="description">Lookup federal riding by location</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api/qc</span>
-            <div class="description">Lookup Quebec provincial riding by location</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api/on</span>
-            <div class="description">Lookup Ontario provincial riding by location</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">POST</span>
-            <span class="url">${baseUrl}/api/batch</span>
-            <div class="description">Immediate batch processing for multiple riding lookups (up to 100 requests)</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">POST</span>
-            <span class="url">${baseUrl}/api/queue/submit</span>
-            <div class="description">Submit batch to persistent queue for asynchronous processing</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api/queue/status</span>
-            <div class="description">Check batch processing status and results</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api/queue/stats</span>
-            <div class="description">Get queue statistics and performance metrics</div>
-        </div>
-        
-        <div class="endpoint">
-            <span class="method">GET</span>
-            <span class="url">${baseUrl}/api/docs</span>
-            <div class="description">OpenAPI specification (JSON)</div>
-        </div>
-
-        <h2>Query Parameters</h2>
-        <p>Provide location information using any of these parameters:</p>
-        
-        <div class="param">
-            <span class="param-name">address</span>
-            <span class="param-desc">Full address to geocode</span>
-        </div>
-        <div class="param">
-            <span class="param-name">postal</span>
-            <span class="param-desc">Canadian postal code (e.g., "K1A 0A6")</span>
-        </div>
-        <div class="param">
-            <span class="param-name">lat</span>
-            <span class="param-desc">Latitude coordinate</span>
-        </div>
-        <div class="param">
-            <span class="param-name">lon</span>
-            <span class="param-desc">Longitude coordinate</span>
-        </div>
-        <div class="param">
-            <span class="param-name">city</span>
-            <span class="param-desc">City name</span>
-        </div>
-        <div class="param">
-            <span class="param-name">state</span>
-            <span class="param-desc">Province or state</span>
-        </div>
-        <div class="param">
-            <span class="param-name">country</span>
-            <span class="param-desc">Country name</span>
-        </div>
-
-        <h2>Example Usage</h2>
-        
-        <h3>By Postal Code</h3>
-        <div class="example">curl -u "username:password" "${baseUrl}/api?postal=K1A 0A6"</div>
-        
-        <h3>By Address</h3>
-        <div class="example">curl -u "username:password" "${baseUrl}/api?address=24 Sussex Drive, Ottawa, ON"</div>
-        
-        <h3>By Coordinates</h3>
-        <div class="example">curl -u "username:password" "${baseUrl}/api?lat=45.4215&lon=-75.6972"</div>
-        
-        <h3>Quebec Provincial Riding</h3>
-        <div class="example">curl -u "username:password" "${baseUrl}/api/qc?address=1234 Rue Saint-Denis, Montréal, QC"</div>
-
-        <h3>Using Your Own Google API Key (BYOK)</h3>
-        <div class="example">curl -H "X-Google-API-Key: YOUR_GOOGLE_API_KEY" "${baseUrl}/api?address=24 Sussex Drive, Ottawa, ON"</div>
-        
-        <h3>Immediate Batch Processing</h3>
-        <div class="example">curl -u "username:password" -X POST "${baseUrl}/api/batch" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "requests": [
-      {
-        "id": "req1",
-        "pathname": "/api",
-        "query": { "postal": "K1A 0A6" }
-      },
-      {
-        "id": "req2", 
-        "pathname": "/api/qc",
-        "query": { "address": "1234 Rue Saint-Denis, Montréal, QC" }
-      },
-      {
-        "id": "req3",
-        "pathname": "/api/on", 
-        "query": { "lat": 43.6532, "lon": -79.3832 }
-      }
-    ]
-  }'</div>
-
-        <h3>Queue-Based Processing</h3>
-        <div class="example"># Submit to queue
-curl -u "username:password" -X POST "${baseUrl}/api/queue/submit" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "requests": [
-      {
-        "id": "req1",
-        "pathname": "/api",
-        "query": { "postal": "K1A 0A6" }
-      }
-    ]
-  }'
-
-# Check status
-curl -u "username:password" "${baseUrl}/api/queue/status?batchId=batch_1234567890_abc123"
-
-# Get queue stats
-curl -u "username:password" "${baseUrl}/api/queue/stats"</div>
-        
-        <div class="byok-note">
-            <strong>BYOK Benefits:</strong> Using your own Google Maps API key bypasses basic authentication and provides unlimited requests with enhanced geocoding accuracy. You get your own usage tracking and billing.
-        </div>
-
-        <h2>Response Format</h2>
-        <div class="example">{
-  "query": {
-    "postal": "K1A 0A6"
-  },
-  "point": {
-    "lon": -75.6972,
-    "lat": 45.4215
-  },
-  "properties": {
-    "FED_NUM": "35047",
-    "FED_NAME": "Ottawa Centre",
-    "PROV_TERR": "Ontario"
-  }
-}</div>
-
-        <div class="links">
-            <a href="${baseUrl}/api/docs" target="_blank">OpenAPI Docs</a>
-            <a href="https://github.com" target="_blank">GitHub</a>
-        </div>
-    </div>
-</body>
-</html>`;
-}
-
-// Import the Durable Object
-import { QueueManagerDO } from './queue-manager';
-
-export { QueueManagerDO };
-
+// Main worker export
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const startTime = Date.now();
+    incrementMetric('requestCount');
+    
+    // Initialize cache warming on first request
+    if (!cacheWarmingInitialized) {
+      cacheWarmingInitialized = true;
+      initializeCacheWarming(env, async (env: Env, r2Key: string) => {
+        await loadGeo(env, r2Key);
+      }, lookupRiding).catch(error => {
+        console.error("Failed to initialize cache warming:", error);
+      });
+    }
+    
+    // Initialize webhook processing
+    initializeWebhookProcessing();
+    
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
       
-      // Check rate limiting for all API endpoints
-      if (pathname.startsWith('/api')) {
-        const clientId = getClientId(request);
-        if (!checkRateLimit(env, clientId)) {
-          return rateLimitExceededResponse();
-        }
+      // Handle CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Google-API-Key',
+            'Access-Control-Max-Age': '86400'
+          }
+        });
       }
       
       // Handle landing page
       if (pathname === "/") {
         const baseUrl = `${url.protocol}//${url.host}`;
         return new Response(createLandingPage(baseUrl), {
-          headers: { "content-type": "text/html; charset=UTF-8" }
+          headers: { 
+            "content-type": "text/html; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       }
       
@@ -1503,57 +281,518 @@ export default {
       if (pathname === "/api/docs") {
         const baseUrl = `${url.protocol}//${url.host}`;
         return new Response(JSON.stringify(createOpenAPISpec(baseUrl)), {
-          headers: { "content-type": "application/json; charset=UTF-8" }
+          headers: { 
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      // Handle Swagger UI
+      if (pathname === "/api/swagger" || pathname === "/swagger") {
+        const baseUrl = `${url.protocol}//${url.host}`;
+        const swaggerHtml = createSwaggerUI(baseUrl);
+        return new Response(swaggerHtml, {
+          headers: { 
+            "content-type": "text/html; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       }
       
-      // Handle batch lookup endpoint (immediate processing)
-      if (pathname === "/api/batch") {
-        if (request.method !== "POST") {
-          return badRequest("Only POST supported for batch endpoint", 405);
-        }
+      // Health check endpoint
+      if (pathname === '/health') {
+        const metrics = getMetrics();
+        const circuitBreakerStates = {
+          geocoding: geocodingCircuitBreaker.getStateInfo('geocoding:nominatim'),
+          r2: r2CircuitBreaker.getStateInfo('r2:federalridings-2024.geojson')
+        };
         
-        // Check basic authentication for batch endpoint
+        return new Response(JSON.stringify({
+          status: 'healthy',
+          timestamp: Date.now(),
+          metrics,
+          circuitBreakers: circuitBreakerStates,
+          cacheWarming: getCacheWarmingStatus()
+        }), {
+          headers: { 
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      
+      // Metrics endpoint
+      if (pathname === '/metrics') {
+        const metrics = getMetricsSummary();
+        return new Response(JSON.stringify(metrics), {
+          headers: { 
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      
+      // Webhook management endpoints
+      if (pathname.startsWith('/webhooks')) {
         if (!checkBasicAuth(request, env)) {
           return unauthorizedResponse();
         }
         
-        const body = await request.json();
-        const validation = validateBatchRequest(body);
-        if (!validation.valid) {
-          return badRequest(validation.error || "Invalid batch request", 400);
+        if (pathname === '/webhooks' && request.method === 'GET') {
+          const webhooks = Array.from(getAllWebhooks().entries()).map(([id, config]) => ({
+            id,
+            url: config.url,
+            events: config.events,
+            active: config.active,
+            createdAt: config.createdAt,
+            lastDelivery: config.lastDelivery,
+            failureCount: config.failureCount
+          }));
+          
+          return new Response(JSON.stringify({ webhooks }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
         }
         
-        const batchId = generateBatchId();
-        const startTime = Date.now();
-        
-        try {
-          const results = await withTimeout(
-            processBatchLookup(env, validation.requests!),
-            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.batch,
-            "Batch processing"
-          );
-          
-          const totalTime = Date.now() - startTime;
-          
-          return new Response(JSON.stringify({
-            batchId,
-            totalRequests: validation.requests!.length,
-            successfulRequests: results.filter(r => !r.error).length,
-            failedRequests: results.filter(r => r.error).length,
-            totalProcessingTime: totalTime,
-            results
-          }), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+        if (pathname === '/webhooks/events' && request.method === 'GET') {
+          const events = getWebhookEvents();
+          return new Response(JSON.stringify({ events }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
-        } catch (error) {
-          return badRequest(
-            error instanceof Error ? error.message : "Batch processing failed",
-            500
-          );
+        }
+        
+        if (pathname === '/webhooks/deliveries' && request.method === 'GET') {
+          const deliveries = getWebhookDeliveries();
+          return new Response(JSON.stringify({ deliveries }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
         }
       }
-
+      
+      // Cache warming status endpoint
+      if (pathname === '/cache-warming' && request.method === 'GET') {
+        const status = getCacheWarmingStatus();
+        return new Response(JSON.stringify({
+          ...status,
+          config: {
+            enabled: true,
+            interval: 6 * 60 * 60 * 1000, // 6 hours
+            batchSize: 5
+          }
+        }), {
+          headers: { 
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      
+      // Handle database endpoints
+      if (pathname.startsWith('/api/database')) {
+        if (pathname === '/api/database/init' && request.method === 'POST') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          try {
+            const success = await initializeSpatialDatabase(env);
+            return new Response(JSON.stringify({
+              success,
+              message: success ? "Database initialized successfully" : "Database initialization failed"
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Database initialization failed",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/database/sync' && request.method === 'POST') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          try {
+            const body = await request.json() as { dataset?: string };
+            const dataset = body.dataset || 'federalridings-2024.geojson';
+            
+            const success = await syncGeoJSONToDatabase(env, dataset, loadGeo);
+            return new Response(JSON.stringify({
+              success,
+              message: success ? `Database synced for ${dataset}` : "Database sync failed",
+              dataset
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Database sync failed",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/database/stats' && request.method === 'GET') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          try {
+            // This would need to be implemented to get actual database stats
+            return new Response(JSON.stringify({
+              enabled: SPATIAL_DB_CONFIG.ENABLED,
+              features: 0, // Would need actual count
+              lastSync: null, // Would need actual timestamp
+              status: SPATIAL_DB_CONFIG.ENABLED ? "active" : "disabled"
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Failed to get database stats",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/database/query' && request.method === 'GET') {
+          const lat = parseFloat(url.searchParams.get('lat') || '');
+          const lon = parseFloat(url.searchParams.get('lon') || '');
+          const dataset = url.searchParams.get('dataset') || 'federalridings-2024.geojson';
+          
+          if (isNaN(lat) || isNaN(lon)) {
+            return badRequest('Invalid lat/lon parameters', 400);
+          }
+          
+          try {
+            const result = await queryRidingFromDatabase(env, dataset, lon, lat);
+            return new Response(JSON.stringify(result), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Database query failed",
+              500
+            );
+          }
+        }
+        
+        return badRequest("Database endpoint not found", 404);
+      }
+      
+      // Handle boundaries endpoints
+      if (pathname.startsWith('/api/boundaries')) {
+        if (pathname === '/api/boundaries/lookup' && request.method === 'GET') {
+          const lat = parseFloat(url.searchParams.get('lat') || '');
+          const lon = parseFloat(url.searchParams.get('lon') || '');
+          const dataset = url.searchParams.get('dataset') || 'federalridings-2024.geojson';
+          
+          if (isNaN(lat) || isNaN(lon)) {
+            return badRequest('Invalid lat/lon parameters', 400);
+          }
+          
+          try {
+            const result = await lookupRiding(env, `/api`, lon, lat);
+            return new Response(JSON.stringify(result), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Boundaries lookup failed",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/boundaries/all' && request.method === 'GET') {
+          const dataset = url.searchParams.get('dataset') || 'federalridings-2024.geojson';
+          const limit = parseInt(url.searchParams.get('limit') || '100');
+          const offset = parseInt(url.searchParams.get('offset') || '0');
+          
+          try {
+            if (SPATIAL_DB_CONFIG.ENABLED && env.RIDING_DB) {
+              const result = await getAllFeaturesFromDatabase(env, dataset, limit, offset);
+              return new Response(JSON.stringify(result), {
+                headers: { 
+                  "content-type": "application/json; charset=UTF-8",
+                  'Access-Control-Allow-Origin': '*'
+                }
+              });
+            } else {
+              return badRequest('Spatial database not enabled', 503);
+            }
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Failed to get boundaries",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/boundaries/config' && request.method === 'GET') {
+          return new Response(JSON.stringify({
+            enabled: SPATIAL_DB_CONFIG.ENABLED,
+            useRtreeIndex: SPATIAL_DB_CONFIG.USE_RTREE_INDEX,
+            batchInsertSize: SPATIAL_DB_CONFIG.BATCH_INSERT_SIZE,
+            datasets: ['federalridings-2024.geojson', 'quebecridings-2025.geojson', 'ontarioridings-2022.geojson']
+          }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+        
+        return badRequest("Boundaries endpoint not found", 404);
+      }
+      
+      // Handle geocoding batch status endpoint
+      if (pathname === "/api/geocoding/batch/status") {
+        if (request.method === "GET") {
+          return new Response(JSON.stringify({
+            enabled: true,
+            maxBatchSize: 10,
+            timeout: 30000,
+            retryAttempts: 3,
+            fallbackToIndividual: true,
+            hasGoogleApiKey: !!(env.GOOGLE_MAPS_KEY),
+            timestamp: Date.now()
+          }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        } else {
+          return badRequest("Method not allowed", 405);
+        }
+      }
+      
+      // Handle cache warming endpoints
+      if (pathname === "/api/cache/warm") {
+        if (request.method === "POST") {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          try {
+            const body = await request.json() as { locations?: Array<{ lat: number; lon: number; postal?: string }> };
+            const locations = body.locations || [];
+            
+            for (const location of locations) {
+              if (location.lat && location.lon) {
+                await loadGeo(env, 'federalridings-2024.geojson');
+              } else if (location.postal) {
+                console.log(`Cache warming for postal code: ${location.postal}`);
+              }
+            }
+            
+            return new Response(JSON.stringify({
+              message: "Cache warming initiated",
+              locations: locations.length,
+              timestamp: Date.now()
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Cache warming failed",
+              500
+            );
+          }
+        } else {
+          return badRequest("Method not allowed", 405);
+        }
+      }
+      
+      // Handle webhook management endpoints
+      if (pathname.startsWith('/api/webhooks')) {
+        if (pathname === '/api/webhooks' && request.method === 'GET') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          const webhooks = Array.from(getAllWebhooks().entries()).map(([id, config]) => ({
+            id,
+            url: config.url,
+            events: config.events,
+            secret: config.secret ? '***' : undefined,
+            createdAt: config.createdAt,
+            lastDelivery: config.lastDelivery,
+            failureCount: config.failureCount,
+            maxFailures: config.maxFailures,
+            active: config.active
+          }));
+          
+          return new Response(JSON.stringify({ webhooks }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+        
+        if (pathname === '/api/webhooks' && request.method === 'POST') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          try {
+            const body = await request.json() as { url: string; events: string[]; secret?: string };
+            const webhookId = createWebhook({
+              url: body.url,
+              events: body.events,
+              secret: body.secret || '',
+              active: true
+            });
+            
+            return new Response(JSON.stringify({
+              webhookId,
+              message: "Webhook created successfully"
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Failed to create webhook",
+              500
+            );
+          }
+        }
+        
+        if (pathname === '/api/webhooks/events' && request.method === 'GET') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          const url = new URL(request.url);
+          const status = url.searchParams.get('status');
+          const webhookId = url.searchParams.get('webhookId');
+          
+          const events = getWebhookEvents(webhookId || undefined);
+          const filteredEvents = status ? events.filter(e => e.status === status) : events;
+          
+          return new Response(JSON.stringify({ events: filteredEvents }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+        
+        if (pathname === '/api/webhooks/deliveries' && request.method === 'GET') {
+          if (!checkBasicAuth(request, env)) {
+            return unauthorizedResponse();
+          }
+          
+          const url = new URL(request.url);
+          const webhookId = url.searchParams.get('webhookId');
+          const status = url.searchParams.get('status');
+          
+          const deliveries = getWebhookDeliveries(webhookId || undefined);
+          const filteredDeliveries = status ? deliveries.filter(d => d.status === status) : deliveries;
+          
+          return new Response(JSON.stringify({ deliveries: filteredDeliveries }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+        
+        return badRequest("Webhook endpoint not found", 404);
+      }
+      
+      // Batch processing endpoints
+      if (pathname.startsWith('/batch')) {
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
+        
+        if (pathname === '/batch' && request.method === 'POST') {
+          try {
+            const body = await request.json() as { requests: any[] };
+            const requests = body.requests.map((req, index) => ({
+              id: req.id || `req_${index}`,
+              query: req.query,
+              pathname: req.pathname || '/api'
+            }));
+            
+            const results = await processBatchLookupWithBatchGeocoding(
+              env, 
+              requests, 
+              geocodeIfNeeded, 
+              lookupRiding, 
+              geocodeBatch
+            );
+            
+            return new Response(JSON.stringify({ results }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Batch processing failed",
+              500
+            );
+          }
+        }
+        
+        if (pathname.startsWith('/batch/') && request.method === 'GET') {
+          const batchId = pathname.split('/')[2];
+          try {
+            const status = await getBatchStatus(env, batchId);
+            return new Response(JSON.stringify(status), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (error) {
+            return badRequest(
+              error instanceof Error ? error.message : "Failed to get batch status",
+              500
+            );
+          }
+        }
+      }
+      
       // Handle queue-based batch submission
       if (pathname === "/api/queue/submit") {
         if (request.method !== "POST") {
@@ -1565,42 +804,51 @@ export default {
           return unauthorizedResponse();
         }
         
-        const body = await request.json();
-        const validation = validateBatchRequest(body);
-        if (!validation.valid) {
-          return badRequest(validation.error || "Invalid batch request", 400);
-        }
-        
         try {
-          const result = await submitBatchToQueue(env, validation.requests!);
+          const body = await request.json() as { requests: any[] };
+          
+          if (!body.requests || !Array.isArray(body.requests)) {
+            return badRequest("Invalid request body. Expected 'requests' array.", 400);
+          }
+          
+          const result = await submitBatchToQueue(env, body.requests);
           return new Response(JSON.stringify(result), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         } catch (error) {
           return badRequest(
-            error instanceof Error ? error.message : "Failed to submit to queue",
+            error instanceof Error ? error.message : "Failed to submit batch to queue",
             500
           );
         }
       }
-
+      
       // Handle batch status check
       if (pathname === "/api/queue/status") {
         if (request.method !== "GET") {
           return badRequest("Only GET supported for status check", 405);
         }
         
-        const url = new URL(request.url);
-        const batchId = url.searchParams.get("batchId");
+        // Check basic authentication
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
         
+        const batchId = url.searchParams.get('batchId');
         if (!batchId) {
-          return badRequest("Missing batchId parameter", 400);
+          return badRequest("Missing required parameter: batchId", 400);
         }
         
         try {
-          const status = await getBatchStatus(env, batchId);
-          return new Response(JSON.stringify(status), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+          const result = await getBatchStatus(env, batchId);
+          return new Response(JSON.stringify(result), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         } catch (error) {
           return badRequest(
@@ -1609,20 +857,26 @@ export default {
           );
         }
       }
-
+      
       // Handle queue processing (for workers)
       if (pathname === "/api/queue/process") {
         if (request.method !== "POST") {
           return badRequest("Only POST supported for queue processing", 405);
         }
         
-        const body = await request.json() as { maxJobs?: number };
-        const { maxJobs = 10 } = body;
+        // Check basic authentication
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
         
         try {
-          const result = await processQueueJobs(env, maxJobs);
+          const body = await request.json() as { maxJobs?: number };
+          const result = await processQueueJobs(env, body.maxJobs || 10);
           return new Response(JSON.stringify(result), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         } catch (error) {
           return badRequest(
@@ -1631,17 +885,39 @@ export default {
           );
         }
       }
-
+      
       // Handle queue statistics
       if (pathname === "/api/queue/stats") {
         if (request.method !== "GET") {
           return badRequest("Only GET supported for queue stats", 405);
         }
         
+        // Check basic authentication
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
+        
         try {
-          const stats = await getQueueStats(env);
+          // Get queue stats from the queue manager
+          if (!env.QUEUE_MANAGER) {
+            return badRequest("Queue manager not configured", 503);
+          }
+          
+          const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
+          const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
+          const response = await queueManager.fetch(new Request("https://queue.local/queue/stats"));
+          
+          if (!response.ok) {
+            const error = await response.json() as { error?: string };
+            throw new Error(error.error || "Failed to get queue stats");
+          }
+          
+          const stats = await response.json();
           return new Response(JSON.stringify(stats), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         } catch (error) {
           return badRequest(
@@ -1651,10 +927,35 @@ export default {
         }
       }
       
-      // Handle single lookup API routes (require authentication)
-      if (pathname === "/api" || pathname === "/api/qc" || pathname === "/api/on") {
-        if (request.method !== "GET") {
-          return badRequest("Only GET supported for single lookup", 405);
+      // Queue processing endpoint (legacy)
+      if (pathname === '/queue/process' && request.method === 'POST') {
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
+        
+        try {
+          const body = await request.json() as { maxJobs?: number };
+          const result = await processQueueJobs(env, body.maxJobs || 10);
+          return new Response(JSON.stringify(result), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Queue processing failed",
+            500
+          );
+        }
+      }
+      
+      // Main lookup endpoint
+      if (pathname.startsWith('/api')) {
+        // Check rate limiting
+        const clientId = getClientId(request);
+        if (!checkRateLimit(env, clientId)) {
+          return rateLimitExceededResponse();
         }
         
         // Check basic authentication for API routes
@@ -1663,9 +964,18 @@ export default {
         }
         
         try {
-          const q = parseQuery(request);
+          const { query, validation } = parseQuery(request);
+          
+          // Check validation result
+          if (!validation.valid) {
+            return badRequest(validation.error || "Invalid query parameters", 400);
+          }
+          
+          // Use sanitized query parameters
+          const sanitizedQuery = validation.sanitized!;
+          
           const { lon, lat } = await withTimeout(
-            geocodeIfNeeded(env, q, request),
+            geocodeIfNeeded(env, sanitizedQuery, request),
             env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.geocoding,
             "Geocoding"
           );
@@ -1675,10 +985,15 @@ export default {
             "Riding lookup"
           );
           
-          return new Response(JSON.stringify({ query: q, point: { lon, lat }, ...result }), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+          recordTiming('totalLookupTime', Date.now() - startTime);
+          return new Response(JSON.stringify({ query: sanitizedQuery, point: { lon, lat }, ...result }), {
+            headers: { 
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         } catch (error) {
+          incrementMetric('errorCount');
           return badRequest(
             error instanceof Error ? error.message : "Lookup failed",
             500
@@ -1688,7 +1003,12 @@ export default {
       
       return badRequest("Not found", 404)
     } catch (err: unknown) {
+      incrementMetric('errorCount');
+      recordTiming('totalLookupTime', Date.now() - startTime);
       return badRequest(err instanceof Error ? err.message : "Unexpected error", 400);
     }
   }
 };
+
+// Export Durable Object
+export { QueueManagerDO };
