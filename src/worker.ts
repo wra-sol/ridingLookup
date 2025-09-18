@@ -6,6 +6,11 @@ export interface Env {
   MAPBOX_TOKEN?: string;
   GOOGLE_MAPS_KEY?: string;
   BASIC_AUTH?: string;
+  BATCH_QUEUE?: DurableObjectNamespace;
+  QUEUE_MANAGER?: DurableObjectNamespace;
+  BATCH_SIZE?: number;
+  BATCH_TIMEOUT?: number;
+  RATE_LIMIT?: number;
 }
 
 interface MapboxFeature {
@@ -49,6 +54,38 @@ interface QueryParams {
 
 interface LookupResult {
   properties: Record<string, unknown> | null;
+}
+
+interface BatchLookupRequest {
+  id: string;
+  query: QueryParams;
+  pathname: string;
+}
+
+interface BatchLookupResponse {
+  id: string;
+  query: QueryParams;
+  point?: { lon: number; lat: number };
+  properties: Record<string, unknown> | null;
+  error?: string;
+  processingTime: number;
+}
+
+interface BatchJob {
+  id: string;
+  requests: BatchLookupRequest[];
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  createdAt: number;
+  completedAt?: number;
+  results: BatchLookupResponse[];
+  errors: string[];
+}
+
+interface TimeoutConfig {
+  geocoding: number;
+  lookup: number;
+  batch: number;
+  total: number;
 }
 
 // Minimal Google Geocoding API response types we use
@@ -103,6 +140,66 @@ function ringContains(point: number[], ring: number[][]): boolean {
 // Minimal in-memory cache of parsed FeatureCollections by key
 const geoCache: Map<string, GeoJSONFeatureCollection> = new Map();
 
+// Timeout configuration (in milliseconds)
+const DEFAULT_TIMEOUTS: TimeoutConfig = {
+  geocoding: 10000,  // 10 seconds for geocoding
+  lookup: 5000,      // 5 seconds for riding lookup
+  batch: 30000,      // 30 seconds for batch processing
+  total: 60000       // 60 seconds total request timeout
+};
+
+// Rate limiting configuration
+const DEFAULT_RATE_LIMIT = 100; // requests per minute
+const DEFAULT_BATCH_SIZE = 50;  // max requests per batch
+
+// Rate limiting storage
+const rateLimitStore: Map<string, { count: number; resetTime: number }> = new Map();
+
+// Timeout wrapper function
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  operation: string
+): Promise<T> {
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)), timeoutMs);
+  });
+  
+  return Promise.race([promise, timeoutPromise]);
+}
+
+// Rate limiting check
+function checkRateLimit(env: Env, clientId: string): boolean {
+  const rateLimit = env.RATE_LIMIT || DEFAULT_RATE_LIMIT;
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute window
+  
+  const current = rateLimitStore.get(clientId);
+  if (!current || now > current.resetTime) {
+    rateLimitStore.set(clientId, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  
+  if (current.count >= rateLimit) {
+    return false;
+  }
+  
+  current.count++;
+  return true;
+}
+
+// Get client identifier for rate limiting
+function getClientId(request: Request): string {
+  // Use IP address or API key for rate limiting
+  const apiKey = request.headers.get("X-Google-API-Key");
+  if (apiKey) return `api:${apiKey}`;
+  
+  const cfConnectingIp = request.headers.get("CF-Connecting-IP");
+  const xForwardedFor = request.headers.get("X-Forwarded-For");
+  const ip = cfConnectingIp || xForwardedFor?.split(',')[0] || "unknown";
+  return `ip:${ip}`;
+}
+
 async function loadGeo(env: Env, key: string): Promise<GeoJSONFeatureCollection> {
   const cached = geoCache.get(key);
   if (cached) return cached;
@@ -148,62 +245,68 @@ async function geocodeIfNeeded(env: Env, qp: QueryParams, request?: Request): Pr
   const query = qp.address || qp.postal || qp.city || qp.state || qp.country;
   if (!query) throw new Error("Missing location: provide lat/lon or address/postal");
 
-  const provider = (env.GEOCODER || "nominatim").toLowerCase();
-  if (provider === "google") {
-    // Check for Google API key in header first, then fall back to environment variable
-    const headerKey = request?.headers.get("X-Google-API-Key");
-    const key = headerKey || env.GOOGLE_MAPS_KEY;
-    if (!key) throw new Error("Google API key not provided. Set X-Google-API-Key header or configure GOOGLE_MAPS_KEY environment variable");
-    const params = new URLSearchParams({ key });
-    // Prefer structured components when available
-    const components: string[] = [];
-    if (qp.postal) components.push(`postal_code:${qp.postal}`);
-    if (qp.city) components.push(`locality:${qp.city}`);
-    if (qp.state) components.push(`administrative_area:${qp.state}`);
-    if (qp.country) components.push(`country:${qp.country}`);
-    if (components.length) params.set("components", components.join("|"));
-    if (qp.address) params.set("address", qp.address);
+  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.geocoding;
+  
+  const geocodePromise = (async () => {
+    const provider = (env.GEOCODER || "nominatim").toLowerCase();
+    if (provider === "google") {
+      // Check for Google API key in header first, then fall back to environment variable
+      const headerKey = request?.headers.get("X-Google-API-Key");
+      const key = headerKey || env.GOOGLE_MAPS_KEY;
+      if (!key) throw new Error("Google API key not provided. Set X-Google-API-Key header or configure GOOGLE_MAPS_KEY environment variable");
+      const params = new URLSearchParams({ key });
+      // Prefer structured components when available
+      const components: string[] = [];
+      if (qp.postal) components.push(`postal_code:${qp.postal}`);
+      if (qp.city) components.push(`locality:${qp.city}`);
+      if (qp.state) components.push(`administrative_area:${qp.state}`);
+      if (qp.country) components.push(`country:${qp.country}`);
+      if (components.length) params.set("components", components.join("|"));
+      if (qp.address) params.set("address", qp.address);
 
-    const url = `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`;
-    const resp = await fetch(url, { headers: { "User-Agent": "riding-lookup/1.0" } });
-    if (!resp.ok) throw new Error(`Google error: ${resp.status}`);
-    const data = await resp.json() as GoogleGeocodeResponse;
-    if (data.status !== "OK" || !data.results?.length) throw new Error("No results from Google");
-    const loc = data.results[0].geometry.location;
-    return { lon: loc.lng, lat: loc.lat };
-  }
-  if (provider === "mapbox") {
-    const token = env.MAPBOX_TOKEN;
-    if (!token) throw new Error("MAPBOX_TOKEN not configured");
-    const resp = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?limit=1&proximity=ca&access_token=${token}`, {
-      headers: { "User-Agent": "riding-lookup/1.0" }
-    });
-    if (!resp.ok) throw new Error(`Mapbox error: ${resp.status}`);
-    const data = await resp.json() as MapboxResponse;
-    const feat = data?.features?.[0];
-    if (!feat?.center) throw new Error("No results from Mapbox");
-    return { lon: feat.center[0], lat: feat.center[1] };
-  }
+      const url = `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`;
+      const resp = await fetch(url, { headers: { "User-Agent": "riding-lookup/1.0" } });
+      if (!resp.ok) throw new Error(`Google error: ${resp.status}`);
+      const data = await resp.json() as GoogleGeocodeResponse;
+      if (data.status !== "OK" || !data.results?.length) throw new Error("No results from Google");
+      const loc = data.results[0].geometry.location;
+      return { lon: loc.lng, lat: loc.lat };
+    }
+    if (provider === "mapbox") {
+      const token = env.MAPBOX_TOKEN;
+      if (!token) throw new Error("MAPBOX_TOKEN not configured");
+      const resp = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?limit=1&proximity=ca&access_token=${token}`, {
+        headers: { "User-Agent": "riding-lookup/1.0" }
+      });
+      if (!resp.ok) throw new Error(`Mapbox error: ${resp.status}`);
+      const data = await resp.json() as MapboxResponse;
+      const feat = data?.features?.[0];
+      if (!feat?.center) throw new Error("No results from Mapbox");
+      return { lon: feat.center[0], lat: feat.center[1] };
+    }
 
-  // Default to Nominatim (OpenStreetMap)
-  const nominatimParams = new URLSearchParams({ format: "jsonv2", limit: "1", country: "canada" });
-  if (qp.address) nominatimParams.set("street", qp.address);
-  if (qp.city) nominatimParams.set("city", qp.city);
-  if (qp.state) nominatimParams.set("state", qp.state);
-  if (qp.country) nominatimParams.set("country", qp.country);
-  if (qp.postal) nominatimParams.set("postalcode", qp.postal);
-  // Fallback free-form
-  if (![qp.address, qp.city, qp.state, qp.country, qp.postal].some(Boolean)) {
-    nominatimParams.set("q", query);
-  }
-  console.log(nominatimParams.toString());
-  const nominatimUrl = `https://nominatim.openstreetmap.org/search?${nominatimParams.toString()}`;
-  const resp = await fetch(nominatimUrl, { headers: { "User-Agent": "riding-lookup/1.0" } });
-  if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
-  const results = await resp.json() as NominatimResult[];
-  const first = results?.[0];
-  if (!first) throw new Error("No results from Nominatim");
-  return { lon: Number(first.lon), lat: Number(first.lat) };
+    // Default to Nominatim (OpenStreetMap)
+    const nominatimParams = new URLSearchParams({ format: "jsonv2", limit: "1", country: "canada" });
+    if (qp.address) nominatimParams.set("street", qp.address);
+    if (qp.city) nominatimParams.set("city", qp.city);
+    if (qp.state) nominatimParams.set("state", qp.state);
+    if (qp.country) nominatimParams.set("country", qp.country);
+    if (qp.postal) nominatimParams.set("postalcode", qp.postal);
+    // Fallback free-form
+    if (![qp.address, qp.city, qp.state, qp.country, qp.postal].some(Boolean)) {
+      nominatimParams.set("q", query);
+    }
+    console.log(nominatimParams.toString());
+    const nominatimUrl = `https://nominatim.openstreetmap.org/search?${nominatimParams.toString()}`;
+    const resp = await fetch(nominatimUrl, { headers: { "User-Agent": "riding-lookup/1.0" } });
+    if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
+    const results = await resp.json() as NominatimResult[];
+    const first = results?.[0];
+    if (!first) throw new Error("No results from Nominatim");
+    return { lon: Number(first.lon), lat: Number(first.lat) };
+  })();
+
+  return withTimeout(geocodePromise, timeoutMs, "Geocoding");
 }
 
 function featurePropertiesIfContains(ridingFeature: GeoJSONFeature, lon: number, lat: number): Record<string, unknown> | null {
@@ -216,13 +319,19 @@ function featurePropertiesIfContains(ridingFeature: GeoJSONFeature, lon: number,
 }
 
 async function lookupRiding(env: Env, pathname: string, lon: number, lat: number): Promise<LookupResult> {
-  const { r2Key } = pickDataset(pathname);
-  const fc = await loadGeo(env, r2Key);
-  for (const feat of fc.features) {
-    const props = featurePropertiesIfContains(feat, lon, lat);
-    if (props) return { properties: props };
-  }
-  return { properties: null };
+  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup;
+  
+  const lookupPromise = (async () => {
+    const { r2Key } = pickDataset(pathname);
+    const fc = await loadGeo(env, r2Key);
+    for (const feat of fc.features) {
+      const props = featurePropertiesIfContains(feat, lon, lat);
+      if (props) return { properties: props };
+    }
+    return { properties: null };
+  })();
+
+  return withTimeout(lookupPromise, timeoutMs, "Riding lookup");
 }
 
 function badRequest(message: string, status = 400) {
@@ -262,6 +371,184 @@ function unauthorizedResponse() {
       "WWW-Authenticate": "Basic realm=\"Riding Lookup API\""
     }
   });
+}
+
+function rateLimitExceededResponse() {
+  return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+    status: 429,
+    headers: { 
+      "content-type": "application/json; charset=UTF-8",
+      "Retry-After": "60"
+    }
+  });
+}
+
+// Queue processing functions
+async function processBatchLookup(env: Env, requests: BatchLookupRequest[]): Promise<BatchLookupResponse[]> {
+  const results: BatchLookupResponse[] = [];
+  const batchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
+  
+  // Process requests in chunks to avoid overwhelming the system
+  for (let i = 0; i < requests.length; i += batchSize) {
+    const chunk = requests.slice(i, i + batchSize);
+    const chunkPromises = chunk.map(async (req) => {
+      const startTime = Date.now();
+      try {
+        const { lon, lat } = await geocodeIfNeeded(env, req.query);
+        const result = await lookupRiding(env, req.pathname, lon, lat);
+        const processingTime = Date.now() - startTime;
+        
+        return {
+          id: req.id,
+          query: req.query,
+          point: { lon, lat },
+          properties: result.properties,
+          processingTime
+        } as BatchLookupResponse;
+      } catch (error) {
+        const processingTime = Date.now() - startTime;
+        return {
+          id: req.id,
+          query: req.query,
+          properties: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+          processingTime
+        } as BatchLookupResponse;
+      }
+    });
+    
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
+  }
+  
+  return results;
+}
+
+// Queue-based batch processing using Durable Objects
+async function submitBatchToQueue(env: Env, requests: BatchLookupRequest[]): Promise<{ batchId: string; status: string }> {
+  if (!env.QUEUE_MANAGER) {
+    throw new Error("Queue manager not configured");
+  }
+
+  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
+  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
+  
+  const response = await queueManager.fetch(new Request("https://queue.local/queue/submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requests })
+  }));
+
+  if (!response.ok) {
+    const error = await response.json() as { error?: string };
+    throw new Error(error.error || "Failed to submit batch to queue");
+  }
+
+  return await response.json();
+}
+
+async function getBatchStatus(env: Env, batchId: string): Promise<any> {
+  if (!env.QUEUE_MANAGER) {
+    throw new Error("Queue manager not configured");
+  }
+
+  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
+  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
+  
+  const response = await queueManager.fetch(new Request(`https://queue.local/queue/status?batchId=${batchId}`));
+  
+  if (!response.ok) {
+    const error = await response.json() as { error?: string };
+    throw new Error(error.error || "Failed to get batch status");
+  }
+
+  return await response.json();
+}
+
+async function processQueueJobs(env: Env, maxJobs: number = 10): Promise<any> {
+  if (!env.QUEUE_MANAGER) {
+    throw new Error("Queue manager not configured");
+  }
+
+  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
+  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
+  
+  const response = await queueManager.fetch(new Request("https://queue.local/queue/process", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxJobs })
+  }));
+  
+  if (!response.ok) {
+    const error = await response.json() as { error?: string };
+    throw new Error(error.error || "Failed to process queue jobs");
+  }
+
+  return await response.json();
+}
+
+async function getQueueStats(env: Env): Promise<any> {
+  if (!env.QUEUE_MANAGER) {
+    throw new Error("Queue manager not configured");
+  }
+
+  const queueManagerId = env.QUEUE_MANAGER.idFromName("main-queue");
+  const queueManager = env.QUEUE_MANAGER.get(queueManagerId);
+  
+  const response = await queueManager.fetch(new Request("https://queue.local/queue/stats"));
+  
+  if (!response.ok) {
+    const error = await response.json() as { error?: string };
+    throw new Error(error.error || "Failed to get queue stats");
+  }
+
+  return await response.json();
+}
+
+// Generate unique batch job ID
+function generateBatchId(): string {
+  return `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// Validate batch request
+function validateBatchRequest(body: any): { valid: boolean; requests?: BatchLookupRequest[]; error?: string } {
+  if (!body || !Array.isArray(body.requests)) {
+    return { valid: false, error: "Invalid request format. Expected { requests: [...] }" };
+  }
+  
+  const requests: BatchLookupRequest[] = [];
+  const maxBatchSize = DEFAULT_BATCH_SIZE * 2; // Allow larger batches for batch endpoint
+  
+  if (body.requests.length > maxBatchSize) {
+    return { valid: false, error: `Too many requests. Maximum ${maxBatchSize} requests per batch.` };
+  }
+  
+  for (let i = 0; i < body.requests.length; i++) {
+    const req = body.requests[i];
+    if (!req || typeof req !== 'object') {
+      return { valid: false, error: `Invalid request at index ${i}. Expected object.` };
+    }
+    
+    if (!req.query || typeof req.query !== 'object') {
+      return { valid: false, error: `Invalid query at index ${i}. Expected object.` };
+    }
+    
+    if (!req.pathname || typeof req.pathname !== 'string') {
+      return { valid: false, error: `Invalid pathname at index ${i}. Expected string.` };
+    }
+    
+    if (!['/api', '/api/qc', '/api/on'].includes(req.pathname)) {
+      return { valid: false, error: `Invalid pathname at index ${i}. Must be one of: /api, /api/qc, /api/on` };
+    }
+    
+    requests.push({
+      id: req.id || `req_${i}`,
+      query: req.query,
+      pathname: req.pathname
+    });
+  }
+  
+  return { valid: true, requests };
 }
 
 function createOpenAPISpec(baseUrl: string) {
@@ -590,6 +877,280 @@ function createOpenAPISpec(baseUrl: string) {
           }
         }
       },
+      "/api/batch": {
+        post: {
+          summary: "Batch Riding Lookup (Immediate)",
+          description: "Process multiple riding lookups immediately in a single request. Supports up to 100 requests per batch with timeout protection and rate limiting.",
+          operationId: "batchLookup",
+          tags: ["Batch Operations"],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    requests: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: {
+                            type: "string",
+                            description: "Optional unique identifier for this request"
+                          },
+                          pathname: {
+                            type: "string",
+                            enum: ["/api", "/api/qc", "/api/on"],
+                            description: "API endpoint to use for lookup"
+                          },
+                          query: {
+                            type: "object",
+                            properties: {
+                              address: { type: "string" },
+                              postal: { type: "string" },
+                              lat: { type: "number" },
+                              lon: { type: "number" },
+                              city: { type: "string" },
+                              state: { type: "string" },
+                              country: { type: "string" }
+                            }
+                          }
+                        },
+                        required: ["pathname", "query"]
+                      },
+                      maxItems: 100
+                    }
+                  },
+                  required: ["requests"]
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Batch processing completed",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      batchId: { type: "string" },
+                      totalRequests: { type: "number" },
+                      successfulRequests: { type: "number" },
+                      failedRequests: { type: "number" },
+                      totalProcessingTime: { type: "number" },
+                      results: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            id: { type: "string" },
+                            query: { type: "object" },
+                            point: {
+                              type: "object",
+                              properties: {
+                                lon: { type: "number" },
+                                lat: { type: "number" }
+                              }
+                            },
+                            properties: { type: "object" },
+                            error: { type: "string" },
+                            processingTime: { type: "number" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              description: "Bad request",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      error: { type: "string" }
+                    }
+                  }
+                }
+              }
+            },
+            "429": {
+              description: "Rate limit exceeded",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      error: { type: "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/queue/submit": {
+        post: {
+          summary: "Submit Batch to Queue",
+          description: "Submit a batch of riding lookups to the persistent queue for asynchronous processing. Returns immediately with batch ID for status tracking.",
+          operationId: "submitBatchToQueue",
+          tags: ["Queue Operations"],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    requests: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          pathname: { type: "string", enum: ["/api", "/api/qc", "/api/on"] },
+                          query: { type: "object" }
+                        },
+                        required: ["pathname", "query"]
+                      }
+                    }
+                  },
+                  required: ["requests"]
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Batch submitted successfully",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      batchId: { type: "string" },
+                      totalJobs: { type: "number" },
+                      status: { type: "string" },
+                      message: { type: "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/queue/status": {
+        get: {
+          summary: "Get Batch Status",
+          description: "Check the status of a submitted batch job including completion progress and results.",
+          operationId: "getBatchStatus",
+          tags: ["Queue Operations"],
+          parameters: [
+            {
+              name: "batchId",
+              in: "query",
+              required: true,
+              schema: { type: "string" }
+            }
+          ],
+          responses: {
+            "200": {
+              description: "Batch status retrieved",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      id: { type: "string" },
+                      status: { type: "string", enum: ["pending", "processing", "completed", "failed", "partially_completed"] },
+                      totalJobs: { type: "number" },
+                      completedJobs: { type: "number" },
+                      failedJobs: { type: "number" },
+                      createdAt: { type: "number" },
+                      completedAt: { type: "number" },
+                      results: { type: "array" },
+                      errors: { type: "array" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/queue/stats": {
+        get: {
+          summary: "Get Queue Statistics",
+          description: "Get comprehensive statistics about the queue including job counts, processing times, and success rates.",
+          operationId: "getQueueStats",
+          tags: ["Queue Operations"],
+          responses: {
+            "200": {
+              description: "Queue statistics retrieved",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      totalJobs: { type: "number" },
+                      pendingJobs: { type: "number" },
+                      processingJobs: { type: "number" },
+                      completedJobs: { type: "number" },
+                      failedJobs: { type: "number" },
+                      retryingJobs: { type: "number" },
+                      deadLetterJobs: { type: "number" },
+                      averageProcessingTime: { type: "number" },
+                      successRate: { type: "number" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/queue/process": {
+        post: {
+          summary: "Process Queue Jobs",
+          description: "Process pending jobs from the queue. This endpoint is typically called by worker processes.",
+          operationId: "processQueueJobs",
+          tags: ["Queue Operations"],
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    maxJobs: { type: "number", default: 10 }
+                  }
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Jobs processed successfully",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      processedJobs: { type: "number" },
+                      results: { type: "array" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "/api/docs": {
         get: {
           summary: "OpenAPI documentation",
@@ -736,6 +1297,10 @@ function createLandingPage(baseUrl: string) {
             <strong>Authentication:</strong> This API uses Basic Authentication. Include your credentials in the Authorization header, or provide your own Google API key via the X-Google-API-Key header to bypass authentication.
         </div>
 
+        <div class="byok-note">
+            <strong>Rate Limiting & Timeouts:</strong> The API includes rate limiting (100 requests/minute by default) and timeout protection. Single lookups timeout after 10s for geocoding and 5s for riding lookup. Batch operations timeout after 30s total. All operations have a 60s maximum request timeout.
+        </div>
+
         <h2>API Endpoints</h2>
         
         <div class="endpoint">
@@ -754,6 +1319,30 @@ function createLandingPage(baseUrl: string) {
             <span class="method">GET</span>
             <span class="url">${baseUrl}/api/on</span>
             <div class="description">Lookup Ontario provincial riding by location</div>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method">POST</span>
+            <span class="url">${baseUrl}/api/batch</span>
+            <div class="description">Immediate batch processing for multiple riding lookups (up to 100 requests)</div>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method">POST</span>
+            <span class="url">${baseUrl}/api/queue/submit</span>
+            <div class="description">Submit batch to persistent queue for asynchronous processing</div>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method">GET</span>
+            <span class="url">${baseUrl}/api/queue/status</span>
+            <div class="description">Check batch processing status and results</div>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method">GET</span>
+            <span class="url">${baseUrl}/api/queue/stats</span>
+            <div class="description">Get queue statistics and performance metrics</div>
         </div>
         
         <div class="endpoint">
@@ -811,6 +1400,49 @@ function createLandingPage(baseUrl: string) {
         <h3>Using Your Own Google API Key (BYOK)</h3>
         <div class="example">curl -H "X-Google-API-Key: YOUR_GOOGLE_API_KEY" "${baseUrl}/api?address=24 Sussex Drive, Ottawa, ON"</div>
         
+        <h3>Immediate Batch Processing</h3>
+        <div class="example">curl -u "username:password" -X POST "${baseUrl}/api/batch" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "requests": [
+      {
+        "id": "req1",
+        "pathname": "/api",
+        "query": { "postal": "K1A 0A6" }
+      },
+      {
+        "id": "req2", 
+        "pathname": "/api/qc",
+        "query": { "address": "1234 Rue Saint-Denis, Montréal, QC" }
+      },
+      {
+        "id": "req3",
+        "pathname": "/api/on", 
+        "query": { "lat": 43.6532, "lon": -79.3832 }
+      }
+    ]
+  }'</div>
+
+        <h3>Queue-Based Processing</h3>
+        <div class="example"># Submit to queue
+curl -u "username:password" -X POST "${baseUrl}/api/queue/submit" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "requests": [
+      {
+        "id": "req1",
+        "pathname": "/api",
+        "query": { "postal": "K1A 0A6" }
+      }
+    ]
+  }'
+
+# Check status
+curl -u "username:password" "${baseUrl}/api/queue/status?batchId=batch_1234567890_abc123"
+
+# Get queue stats
+curl -u "username:password" "${baseUrl}/api/queue/stats"</div>
+        
         <div class="byok-note">
             <strong>BYOK Benefits:</strong> Using your own Google Maps API key bypasses basic authentication and provides unlimited requests with enhanced geocoding accuracy. You get your own usage tracking and billing.
         </div>
@@ -840,13 +1472,24 @@ function createLandingPage(baseUrl: string) {
 </html>`;
 }
 
+// Import the Durable Object
+import { QueueManagerDO } from './queue-manager';
+
+export { QueueManagerDO };
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
       
-      if (request.method !== "GET") return badRequest("Only GET supported", 405);
+      // Check rate limiting for all API endpoints
+      if (pathname.startsWith('/api')) {
+        const clientId = getClientId(request);
+        if (!checkRateLimit(env, clientId)) {
+          return rateLimitExceededResponse();
+        }
+      }
       
       // Handle landing page
       if (pathname === "/") {
@@ -855,6 +1498,7 @@ export default {
           headers: { "content-type": "text/html; charset=UTF-8" }
         });
       }
+      
       // Handle OpenAPI docs
       if (pathname === "/api/docs") {
         const baseUrl = `${url.protocol}//${url.host}`;
@@ -863,19 +1507,183 @@ export default {
         });
       }
       
-      // Handle API routes (require authentication)
+      // Handle batch lookup endpoint (immediate processing)
+      if (pathname === "/api/batch") {
+        if (request.method !== "POST") {
+          return badRequest("Only POST supported for batch endpoint", 405);
+        }
+        
+        // Check basic authentication for batch endpoint
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
+        
+        const body = await request.json();
+        const validation = validateBatchRequest(body);
+        if (!validation.valid) {
+          return badRequest(validation.error || "Invalid batch request", 400);
+        }
+        
+        const batchId = generateBatchId();
+        const startTime = Date.now();
+        
+        try {
+          const results = await withTimeout(
+            processBatchLookup(env, validation.requests!),
+            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.batch,
+            "Batch processing"
+          );
+          
+          const totalTime = Date.now() - startTime;
+          
+          return new Response(JSON.stringify({
+            batchId,
+            totalRequests: validation.requests!.length,
+            successfulRequests: results.filter(r => !r.error).length,
+            failedRequests: results.filter(r => r.error).length,
+            totalProcessingTime: totalTime,
+            results
+          }), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Batch processing failed",
+            500
+          );
+        }
+      }
+
+      // Handle queue-based batch submission
+      if (pathname === "/api/queue/submit") {
+        if (request.method !== "POST") {
+          return badRequest("Only POST supported for queue submit", 405);
+        }
+        
+        // Check basic authentication
+        if (!checkBasicAuth(request, env)) {
+          return unauthorizedResponse();
+        }
+        
+        const body = await request.json();
+        const validation = validateBatchRequest(body);
+        if (!validation.valid) {
+          return badRequest(validation.error || "Invalid batch request", 400);
+        }
+        
+        try {
+          const result = await submitBatchToQueue(env, validation.requests!);
+          return new Response(JSON.stringify(result), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Failed to submit to queue",
+            500
+          );
+        }
+      }
+
+      // Handle batch status check
+      if (pathname === "/api/queue/status") {
+        if (request.method !== "GET") {
+          return badRequest("Only GET supported for status check", 405);
+        }
+        
+        const url = new URL(request.url);
+        const batchId = url.searchParams.get("batchId");
+        
+        if (!batchId) {
+          return badRequest("Missing batchId parameter", 400);
+        }
+        
+        try {
+          const status = await getBatchStatus(env, batchId);
+          return new Response(JSON.stringify(status), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Failed to get batch status",
+            500
+          );
+        }
+      }
+
+      // Handle queue processing (for workers)
+      if (pathname === "/api/queue/process") {
+        if (request.method !== "POST") {
+          return badRequest("Only POST supported for queue processing", 405);
+        }
+        
+        const body = await request.json() as { maxJobs?: number };
+        const { maxJobs = 10 } = body;
+        
+        try {
+          const result = await processQueueJobs(env, maxJobs);
+          return new Response(JSON.stringify(result), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Failed to process queue jobs",
+            500
+          );
+        }
+      }
+
+      // Handle queue statistics
+      if (pathname === "/api/queue/stats") {
+        if (request.method !== "GET") {
+          return badRequest("Only GET supported for queue stats", 405);
+        }
+        
+        try {
+          const stats = await getQueueStats(env);
+          return new Response(JSON.stringify(stats), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Failed to get queue stats",
+            500
+          );
+        }
+      }
+      
+      // Handle single lookup API routes (require authentication)
       if (pathname === "/api" || pathname === "/api/qc" || pathname === "/api/on") {
+        if (request.method !== "GET") {
+          return badRequest("Only GET supported for single lookup", 405);
+        }
+        
         // Check basic authentication for API routes
         if (!checkBasicAuth(request, env)) {
           return unauthorizedResponse();
         }
         
-        const q = parseQuery(request);
-        const { lon, lat } = await geocodeIfNeeded(env, q, request);
-        const result = await lookupRiding(env, pathname, lon, lat);
-        return new Response(JSON.stringify({ query: q, point: { lon, lat }, ...result }), {
-          headers: { "content-type": "application/json; charset=UTF-8" }
-        });
+        try {
+          const q = parseQuery(request);
+          const { lon, lat } = await withTimeout(
+            geocodeIfNeeded(env, q, request),
+            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.geocoding,
+            "Geocoding"
+          );
+          const result = await withTimeout(
+            lookupRiding(env, pathname, lon, lat),
+            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup,
+            "Riding lookup"
+          );
+          
+          return new Response(JSON.stringify({ query: q, point: { lon, lat }, ...result }), {
+            headers: { "content-type": "application/json; charset=UTF-8" }
+          });
+        } catch (error) {
+          return badRequest(
+            error instanceof Error ? error.message : "Lookup failed",
+            500
+          );
+        }
       }
       
       return badRequest("Not found", 404)
