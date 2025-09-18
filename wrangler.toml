@@ -9,6 +9,11 @@ compatibility_date = "2024-09-01"
 binding = "RIDINGS"
 bucket_name = "ridings"
 
+[[kv_namespaces]]
+binding = "GEOCODING_CACHE"
+id = "your-geocoding-cache-id"
+preview_id = "your-preview-geocoding-cache-id"
+
 [[durable_objects.bindings]]
 name = "QUEUE_MANAGER"
 class_name = "QueueManagerDO"
