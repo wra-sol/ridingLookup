@@ -7,268 +7,992 @@ export function createLandingPage(baseUrl: string) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Riding Lookup API</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css">
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            line-height: 1.6;
+        * {
             margin: 0;
-            padding: 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
+            padding: 0;
+            box-sizing: border-box;
         }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            line-height: 1.5;
+            color: #1a1a1a;
+            background: #ffffff;
+            font-size: 16px;
+        }
+        
         .container {
-            max-width: 800px;
+            max-width: 1200px;
             margin: 0 auto;
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            padding: 60px 40px;
         }
+        
         h1 {
-            color: #333;
-            text-align: center;
-            margin-bottom: 10px;
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            letter-spacing: -0.02em;
         }
+        
         .subtitle {
-            text-align: center;
+            font-size: 18px;
             color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1em;
+            margin-bottom: 40px;
+            font-weight: 400;
         }
-        .feature {
-            background: #f8f9fa;
-            padding: 15px;
-            margin: 15px 0;
-            border-left: 4px solid #667eea;
-            border-radius: 4px;
+        
+        .section {
+            margin-bottom: 32px;
         }
-        .example {
-            background: #2d3748;
-            color: #e2e8f0;
-            padding: 15px;
-            border-radius: 6px;
-            font-family: 'Monaco', 'Menlo', monospace;
+        
+        .section h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #1a1a1a;
+        }
+        
+        .section h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin: 24px 0 12px 0;
+            color: #1a1a1a;
+        }
+        
+        .endpoint {
+            background: #f6f8fa;
+            border: 1px solid #d0d7de;
+            padding: 12px 16px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
             font-size: 14px;
-            overflow-x: auto;
-            margin: 15px 0;
+            margin: 8px 0 12px 0;
+            border-radius: 6px;
+            color: #24292f;
+            font-weight: 500;
         }
-        .links {
+        
+        .example {
+            background: #ffffff;
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            margin: 16px 0;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            padding: 16px;
+            & h3 {
+            margin-left: 16px;
+            }
+        }
+        
+        .example-tabs {
+            display: flex;
+            background: #f6f8fa;
+            border-bottom: 1px solid #d0d7de;
+            padding: 4px;
+        }
+        
+        .example-tab {
+            background: none;
+            border: none;
+            padding: 8px 16px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 500;
+            color: #656d76;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+            flex: 1;
             text-align: center;
-            margin-top: 30px;
         }
+        
+        .example-tab:hover {
+            color: #24292f;
+            background: #ffffff;
+        }
+        
+        .example-tab.active {
+            color: #24292f;
+            background: #ffffff;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .response-tabs {
+            display: flex;
+            background: #f6f8fa;
+            border-top: 1px solid #d0d7de;
+            padding: 4px;
+            margin-top: 12px;
+        }
+        
+        .response-tab {
+            background: none;
+            border: none;
+            padding: 8px 16px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 500;
+            color: #656d76;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+            flex: 1;
+            text-align: center;
+        }
+        
+        .response-tab:hover {
+            color: #24292f;
+            background: #ffffff;
+        }
+        
+        .response-tab.active {
+            color: #24292f;
+            background: #ffffff;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .response-content {
+            display: none;
+        }
+        
+        .response-content.active {
+            display: block;
+        }
+        
+        .example-content {
+            display: none;
+        }
+        
+        .example-content.active {
+            display: block;
+        }
+        
+        .example-code {
+            background: #0d1117;
+            color: #e6edf3;
+            padding: 16px 20px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 0;
+            border: 1px solid #30363d;
+            position: relative;
+        }
+        
+        .example-code::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, #ff7b72, #79c0ff, #a5d6ff, #ffa657, #f0f6fc);
+        }
+        
+        .datasets {
+            list-style: none;
+        }
+        
+        .datasets li {
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 15px;
+        }
+        
+        .datasets li:last-child {
+            border-bottom: none;
+        }
+        
+        .datasets strong {
+            font-weight: 600;
+            color: #1a1a1a;
+        }
+        
+        .links {
+            margin-top: 48px;
+            padding-top: 32px;
+            border-top: 1px solid #e1e5e9;
+        }
+        
         .links a {
             display: inline-block;
-            margin: 10px;
-            padding: 12px 24px;
-            background: #667eea;
-            color: white;
+            margin-right: 24px;
+            color: #0066cc;
             text-decoration: none;
-            border-radius: 6px;
-            transition: background 0.3s;
+            font-weight: 500;
+            font-size: 15px;
         }
+        
         .links a:hover {
-            background: #5a67d8;
+            text-decoration: underline;
         }
-        .byok-note {
-            background: #e6fffa;
-            border: 1px solid #81e6d9;
-            padding: 15px;
+        
+        .note {
+            background: #f0f8ff;
+            border: 1px solid #b6e3ff;
+            border-left: 4px solid #0969da;
+            padding: 16px;
+            margin: 24px 0;
+            font-size: 14px;
+            color: #0969da;
             border-radius: 6px;
-            margin: 20px 0;
         }
-        .endpoint {
-            background: #f7fafc;
-            padding: 10px;
+        
+        .note code {
+            background: #e1f5fe;
+            color: #0969da;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-size: 13px;
+        }
+        
+        .response {
+            background: #f8f9fa;
+            border: 1px solid #e1e5e9;
+            padding: 16px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-size: 13px;
+            margin: 8px 0;
             border-radius: 4px;
-            font-family: monospace;
-            margin: 10px 0;
+            overflow-x: auto;
+        }
+        
+        .endpoint-section {
+            background: #ffffff;
+            border: 1px solid #e1e5e9;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+        }
+        
+        .endpoint-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .endpoint-section .method {
+            background: #28a745;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        
+        .endpoint-section .method.post {
+            background: #007bff;
+        }
+        
+        .endpoint-section .url {
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            background: #f6f8fa;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #24292f;
+        }
+        
+        .endpoint-section .description {
+            font-weight: 600;
+            color: #1a1a1a;
+            font-size: 16px;
+        }
+        
+        .endpoint-section p {
+            margin: 8px 0;
+            color: #666;
+            line-height: 1.5;
+        }
+        
+        .param-list {
+            margin: 12px 0;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border-left: 3px solid #007bff;
+        }
+        
+        .param {
+            margin: 4px 0;
+            font-size: 14px;
+        }
+        
+        .error-codes {
+            background: #fff5f5;
+            border: 1px solid #fed7d7;
+            border-radius: 6px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+        
+        .error-codes h4 {
+            color: #c53030;
+            margin: 0 0 12px 0;
+            font-size: 16px;
+        }
+        
+        .error-code {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #fed7d7;
+        }
+        
+        .error-code:last-child {
+            border-bottom: none;
+        }
+        
+        .error-code-name {
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            font-weight: 600;
+            color: #c53030;
+        }
+        
+        .error-code-desc {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .rate-limits {
+            background: #f0f8ff;
+            border: 1px solid #b6e3ff;
+            border-radius: 6px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+        
+        .rate-limits h4 {
+            color: #0969da;
+            margin: 0 0 12px 0;
+            font-size: 16px;
+        }
+        
+        .rate-limit-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            border-bottom: 1px solid #b6e3ff;
+        }
+        
+        .rate-limit-item:last-child {
+            border-bottom: none;
+        }
+        
+        .rate-limit-type {
+            font-weight: 600;
+            color: #0969da;
+        }
+        
+        .rate-limit-value {
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+            background: #e1f5fe;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 13px;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🏛️ Riding Lookup API</h1>
+        <h1>Riding Lookup API</h1>
         <p class="subtitle">Find Canadian federal, provincial, and territorial ridings by location</p>
         
-        <div class="feature">
-            <strong>🌍 Multi-Provider Geocoding:</strong> Google Maps (BYOK), Mapbox, and Nominatim support
-        </div>
-        
-        <div class="feature">
-            <strong>⚡ High Performance:</strong> Built on Cloudflare Workers with global edge caching
-        </div>
-        
-        <div class="feature">
-            <strong>📊 Batch Processing:</strong> Process multiple locations efficiently with queue-based processing
-        </div>
+        <div class="section">
+            <h2>Usage</h2>
+            
+            <div class="example">
+                <h3>Postal Code</h3>
+                <div class="endpoint">GET ${baseUrl}/api?postal=K1A 0A6</div>
+                <div class="example-tabs">
+                    <button class="example-tab active" data-type="curl">curl</button>
+                    <button class="example-tab" data-type="fetch">fetch</button>
+                    <button class="example-tab" data-type="python">python</button>
+                </div>
+                <div class="example-content active" data-type="curl">
+                    <pre><code class="language-bash">curl "${baseUrl}/api?postal=K1A 0A6"</code></pre>
+                </div>
+                <div class="example-content" data-type="fetch">
+                    <pre><code class="language-javascript">fetch("${baseUrl}/api?postal=K1A 0A6")
+  .then(response => response.json())
+  .then(data => console.log(data));</code></pre>
+                </div>
+                <div class="example-content" data-type="python">
+                    <pre><code class="language-python">import requests
 
-        <div class="feature">
-            <strong>🔧 BYOK Support:</strong> Bring Your Own Key for Google Maps API with unlimited requests
-        </div>
-
-        <h2>Quick Start</h2>
-        
-        <div class="endpoint">GET ${baseUrl}/api?postal=K1A 0A6</div>
-        <div class="example">curl "${baseUrl}/api?postal=K1A 0A6"</div>
-        
-        <div class="endpoint">GET ${baseUrl}/api?address=123 Main St Toronto</div>
-        <div class="example">curl "${baseUrl}/api?address=123%20Main%20St%20Toronto"</div>
-        
-        <div class="endpoint">GET ${baseUrl}/api?lat=45.4215&lon=-75.6972</div>
-        <div class="example">curl "${baseUrl}/api?lat=45.4215&lon=-75.6972"</div>
-
-        <h2>Available Datasets</h2>
-        <ul>
-            <li><strong>/api</strong> - Federal ridings (338 ridings)</li>
-            <li><strong>/api/qc</strong> - Quebec provincial ridings (125 ridings)</li>
-            <li><strong>/api/on</strong> - Ontario provincial ridings (124 ridings)</li>
-        </ul>
-
-        <h2>Advanced Features</h2>
-        
-        <h3>Database Operations</h3>
-        <div class="example"># Initialize spatial database
-curl -u "username:password" -X POST "${baseUrl}/api/database/init"
-
-# Sync GeoJSON to database
-curl -u "username:password" -X POST "${baseUrl}/api/database/sync" \\
-  -H "Content-Type: application/json" \\
-  -d '{"dataset": "federalridings-2024.geojson"}'
-
-# Query database directly
-curl "${baseUrl}/api/database/query?lat=45.4215&lon=-75.6972&dataset=federalridings-2024.geojson"
-
-# Get database stats
-curl -u "username:password" "${baseUrl}/api/database/stats"</div>
-
-        <h3>Boundaries API</h3>
-        <div class="example"># Lookup boundaries by coordinates
-curl "${baseUrl}/api/boundaries/lookup?lat=45.4215&lon=-75.6972&dataset=federalridings-2024.geojson"
-
-# Get all boundaries (paginated)
-curl "${baseUrl}/api/boundaries/all?dataset=federalridings-2024.geojson&limit=50&offset=0"
-
-# Get boundaries configuration
-curl "${baseUrl}/api/boundaries/config"</div>
-
-        <h3>Cache Management</h3>
-        <div class="example"># Trigger cache warming
-curl -u "username:password" -X POST "${baseUrl}/api/cache/warm" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "locations": [
-      {"lat": 45.4215, "lon": -75.6972},
-      {"postal": "K1A 0A6"}
-    ]
-  }'</div>
-
-        <h3>Webhook Management</h3>
-        <div class="example"># List webhooks
-curl -u "username:password" "${baseUrl}/api/webhooks"
-
-# Create webhook
-curl -u "username:password" -X POST "${baseUrl}/api/webhooks" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "url": "https://your-app.com/webhooks/riding-lookup",
-    "events": ["batch.completed", "batch.failed"],
-    "secret": "your-webhook-secret"
-  }'
-
-# Get webhook events
-curl -u "username:password" "${baseUrl}/api/webhooks/events?status=pending"
-
-# Get webhook deliveries
-curl -u "username:password" "${baseUrl}/api/webhooks/deliveries?webhookId=webhook_123"</div>
-
-        <h2>Authentication</h2>
-        <p>For production use, include your credentials:</p>
-        <div class="example">curl -u "username:password" "${baseUrl}/api?postal=K1A 0A6"</div>
-        
-        <p>Or use your own Google Maps API key to bypass authentication:</p>
-        <div class="example">curl -H "X-Google-API-Key: YOUR_API_KEY" "${baseUrl}/api?address=123 Main St"</div>
-
-        <h2>Batch Processing</h2>
-        
-        <h3>Immediate Batch Processing</h3>
-        <div class="example">curl -u "username:password" -X POST "${baseUrl}/batch" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "requests": [
-      {
-        "id": "req1",
-        "pathname": "/api",
-        "query": { "postal": "K1A 0A6" }
-      },
-      {
-        "id": "req2", 
-        "pathname": "/api/qc",
-        "query": { "address": "1234 Rue Saint-Denis, Montréal, QC" }
-      },
-      {
-        "id": "req3",
-        "pathname": "/api/on", 
-        "query": { "lat": 43.6532, "lon": -79.3832 }
-      }
-    ]
-  }'</div>
-
-        <h3>Queue-Based Processing</h3>
-        <div class="example"># Submit to queue
-curl -u "username:password" -X POST "${baseUrl}/api/queue/submit" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "requests": [
-      {
-        "id": "req1",
-        "pathname": "/api",
-        "query": { "postal": "K1A 0A6" }
-      },
-      {
-        "id": "req2",
-        "pathname": "/api/qc",
-        "query": { "address": "1234 Rue Saint-Denis, Montréal, QC" }
-      }
-    ]
-  }'
-
-# Check status
-curl -u "username:password" "${baseUrl}/api/queue/status?batchId=batch_1234567890_abc123"
-
-# Get queue stats
-curl -u "username:password" "${baseUrl}/api/queue/stats"
-
-# Process queue jobs (for workers)
-curl -u "username:password" -X POST "${baseUrl}/api/queue/process" \\
-  -H "Content-Type: application/json" \\
-  -d '{"maxJobs": 10}'</div>
-        
-        <div class="byok-note">
-            <strong>BYOK Benefits:</strong> Using your own Google Maps API key bypasses basic authentication and provides unlimited requests with enhanced geocoding accuracy. You get your own usage tracking and billing. <strong>Batch Geocoding:</strong> Process up to 10 addresses per API call for maximum cost efficiency and performance.
-        </div>
-
-        <h2>Response Format</h2>
-        <div class="example">{
-  "query": {
-    "postal": "K1A 0A6"
-  },
-  "point": {
-    "lon": -75.6972,
-    "lat": 45.4215
-  },
+response = requests.get("${baseUrl}/api", params={"postal": "K1A 0A6"})
+data = response.json()
+print(data)</code></pre>
+                </div>
+                
+                <div class="response-tabs">
+                    <button class="response-tab active" data-type="success">Success</button>
+                    <button class="response-tab" data-type="error">Error</button>
+                </div>
+                <div class="response-content active" data-type="success">
+                    <pre><code class="language-json">{
+  "query": {"postal": "K1A 0A6"},
+  "point": {"lon": -75.6972, "lat": 45.4215},
   "properties": {
     "FED_NUM": "35047",
     "FED_NAME": "Ottawa Centre",
     "PROV_TERR": "Ontario"
   }
-}</div>
+}</code></pre>
+                </div>
+                <div class="response-content" data-type="error">
+                    <pre><code class="language-json">{
+  "error": "Invalid postal code format",
+  "code": "INVALID_POSTAL_CODE"
+}</code></pre>
+                </div>
+            </div>
+            
+            <div class="example">
+                <h3>Address</h3>
+                <div class="endpoint">GET ${baseUrl}/api?address=123 Main St Toronto</div>
+                <div class="example-tabs">
+                    <button class="example-tab active" data-type="curl">curl</button>
+                    <button class="example-tab" data-type="fetch">fetch</button>
+                    <button class="example-tab" data-type="python">python</button>
+                </div>
+                <div class="example-content active" data-type="curl">
+                    <pre><code class="language-bash">curl "${baseUrl}/api?address=123%20Main%20St%20Toronto"</code></pre>
+                </div>
+                <div class="example-content" data-type="fetch">
+                    <pre><code class="language-javascript">fetch("${baseUrl}/api?address=123%20Main%20St%20Toronto")
+  .then(response => response.json())
+  .then(data => console.log(data));</code></pre>
+                </div>
+                <div class="example-content" data-type="python">
+                    <pre><code class="language-python">import requests
+
+response = requests.get("${baseUrl}/api", params={"address": "123 Main St Toronto"})
+data = response.json()
+print(data)</code></pre>
+                </div>
+                
+                <div class="response-tabs">
+                    <button class="response-tab active" data-type="success">Success</button>
+                    <button class="response-tab" data-type="error">Error</button>
+                </div>
+                <div class="response-content active" data-type="success">
+                    <pre><code class="language-json">{
+  "query": {"address": "123 Main St Toronto"},
+  "point": {"lon": -79.3832, "lat": 43.6532},
+  "properties": {
+    "FED_NUM": "35039",
+    "FED_NAME": "Toronto Centre",
+    "PROV_TERR": "Ontario"
+  }
+}</code></pre>
+                </div>
+                <div class="response-content" data-type="error">
+                    <pre><code class="language-json">{
+  "error": "Address not found",
+  "code": "GEOCODING_FAILED"
+}</code></pre>
+                </div>
+            </div>
+            
+            <div class="example">
+                <h3>Coordinates</h3>
+                <div class="endpoint">GET ${baseUrl}/api?lat=45.4215&lon=-75.6972</div>
+                <div class="example-tabs">
+                    <button class="example-tab active" data-type="curl">curl</button>
+                    <button class="example-tab" data-type="fetch">fetch</button>
+                    <button class="example-tab" data-type="python">python</button>
+                </div>
+                <div class="example-content active" data-type="curl">
+                    <pre><code class="language-bash">curl "${baseUrl}/api?lat=45.4215&lon=-75.6972"</code></pre>
+                </div>
+                <div class="example-content" data-type="fetch">
+                    <pre><code class="language-javascript">fetch("${baseUrl}/api?lat=45.4215&lon=-75.6972")
+  .then(response => response.json())
+  .then(data => console.log(data));</code></pre>
+                </div>
+                <div class="example-content" data-type="python">
+                    <pre><code class="language-python">import requests
+
+response = requests.get("${baseUrl}/api", params={"lat": 45.4215, "lon": -75.6972})
+data = response.json()
+print(data)</code></pre>
+                </div>
+                
+                <div class="response-tabs">
+                    <button class="response-tab active" data-type="success">Success</button>
+                    <button class="response-tab" data-type="error">Error</button>
+                </div>
+                <div class="response-content active" data-type="success">
+                    <pre><code class="language-json">{
+  "query": {"lat": 45.4215, "lon": -75.6972},
+  "point": {"lon": -75.6972, "lat": 45.4215},
+  "properties": {
+    "FED_NUM": "35047",
+    "FED_NAME": "Ottawa Centre",
+    "PROV_TERR": "Ontario"
+  }
+}</code></pre>
+                </div>
+                <div class="response-content" data-type="error">
+                    <pre><code class="language-json">{
+  "error": "Invalid coordinates",
+  "code": "INVALID_COORDINATES"
+}</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>API Endpoints</h2>
+            
+            <h3>Core Lookup Endpoints</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api</span>
+                    <span class="description">Federal Riding Lookup</span>
+                </div>
+                <p>Find the federal riding for any location in Canada. Supports postal codes, addresses, and coordinates. Returns riding information including FED_NUM, FED_NAME, and PROV_TERR.</p>
+                <div class="param-list">
+                    <div class="param"><strong>postal</strong> - Canadian postal code (e.g., "K1A 0A6")</div>
+                    <div class="param"><strong>address</strong> - Full address to geocode</div>
+                    <div class="param"><strong>lat/lon</strong> - Latitude and longitude coordinates</div>
+                    <div class="param"><strong>city/state/country</strong> - Location components</div>
+                </div>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/qc</span>
+                    <span class="description">Quebec Provincial Riding Lookup</span>
+                </div>
+                <p>Find the Quebec provincial riding for any location in Quebec. Uses the 2025 Quebec provincial riding boundaries.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/on</span>
+                    <span class="description">Ontario Provincial Riding Lookup</span>
+                </div>
+                <p>Find the Ontario provincial riding for any location in Ontario. Uses the 2022 Ontario provincial riding boundaries.</p>
+            </div>
+
+            <h3>Batch Processing</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">POST</span>
+                    <span class="url">/batch</span>
+                    <span class="description">Immediate Batch Processing</span>
+                </div>
+                <p>Process multiple lookup requests immediately using Google Maps batch geocoding for optimal performance. Supports up to 100 requests per batch.</p>
+                
+                <h4>Example Request</h4>
+                <pre><code class="language-bash">curl -X POST "${baseUrl}/batch" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "requests": [
+      {
+        "id": "1",
+        "pathname": "/api",
+        "query": {"postal": "K1A 0A6"}
+      },
+      {
+        "id": "2", 
+        "pathname": "/api",
+        "query": {"address": "123 Main St Toronto"}
+      }
+    ]
+  }'</code></pre>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">POST</span>
+                    <span class="url">/api/queue/submit</span>
+                    <span class="description">Queue Batch for Processing</span>
+                </div>
+                <p>Submit a batch of requests to the persistent queue for asynchronous processing. Returns immediately with a batch ID for status tracking.</p>
+                
+                <h4>Example Request</h4>
+                <pre><code class="language-bash">curl -X POST "${baseUrl}/api/queue/submit" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "requests": [
+      {
+        "id": "1",
+        "pathname": "/api",
+        "query": {"postal": "K1A 0A6"}
+      },
+      {
+        "id": "2",
+        "pathname": "/api/qc", 
+        "query": {"address": "1234 Rue Saint-Denis, Montréal"}
+      }
+    ]
+  }'</code></pre>
+                
+                <h4>Example Response</h4>
+                <pre><code class="language-json">{
+  "batchId": "batch_1234567890",
+  "status": "pending",
+  "message": "Batch submitted successfully"
+}</code></pre>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/queue/status</span>
+                    <span class="description">Check Batch Status</span>
+                </div>
+                <p>Check the status of a queued batch including completion progress and results. Use the batchId returned from queue submission.</p>
+                
+                <h4>Example Request</h4>
+                <pre><code class="language-bash">curl "${baseUrl}/api/queue/status?batchId=batch_1234567890"</code></pre>
+                
+                <h4>Example Response</h4>
+                <pre><code class="language-json">{
+  "batchId": "batch_1234567890",
+  "status": "completed",
+  "progress": {
+    "total": 2,
+    "completed": 2,
+    "failed": 0,
+    "pending": 0
+  },
+  "results": [
+    {
+      "id": "1",
+      "query": {"postal": "K1A 0A6"},
+      "point": {"lon": -75.6972, "lat": 45.4215},
+      "properties": {
+        "FED_NUM": "35047",
+        "FED_NAME": "Ottawa Centre",
+        "PROV_TERR": "Ontario"
+      },
+      "processingTime": 150
+    }
+  ],
+  "createdAt": "2024-01-15T10:30:00Z",
+  "updatedAt": "2024-01-15T10:30:05Z"
+}</code></pre>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/queue/stats</span>
+                    <span class="description">Queue Statistics</span>
+                </div>
+                <p>Get comprehensive statistics about the queue including job counts, processing times, and success rates.</p>
+            </div>
+
+            <h3>Database Operations</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">POST</span>
+                    <span class="url">/api/database/init</span>
+                    <span class="description">Initialize Spatial Database</span>
+                </div>
+                <p>Initialize the spatial database with required tables and indexes for optimal performance.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">POST</span>
+                    <span class="url">/api/database/sync</span>
+                    <span class="description">Sync GeoJSON to Database</span>
+                </div>
+                <p>Synchronize GeoJSON data to the spatial database for faster lookups.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/database/stats</span>
+                    <span class="description">Database Statistics</span>
+                </div>
+                <p>Get statistics about the spatial database including feature counts and sync status.</p>
+            </div>
+
+            <h3>Boundary Data</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/boundaries/lookup</span>
+                    <span class="description">Lookup Boundaries by Coordinates</span>
+                </div>
+                <p>Find boundaries using coordinates with optional dataset selection. Useful for direct database queries.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/boundaries/all</span>
+                    <span class="description">Get All Boundaries</span>
+                </div>
+                <p>Retrieve all boundaries from the database with pagination support.</p>
+            </div>
+
+            <h3>System & Monitoring</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/health</span>
+                    <span class="description">Health Check</span>
+                </div>
+                <p>Get comprehensive health status including metrics, circuit breakers, and cache warming status.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/metrics</span>
+                    <span class="description">Performance Metrics</span>
+                </div>
+                <p>Get detailed performance metrics and statistics for monitoring and optimization.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/cache-warming</span>
+                    <span class="description">Cache Warming Status</span>
+                </div>
+                <p>Get current cache warming status and configuration for performance optimization.</p>
+            </div>
+
+            <h3>Webhook Management</h3>
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET/POST</span>
+                    <span class="url">/api/webhooks</span>
+                    <span class="description">Webhook Management</span>
+                </div>
+                <p>List and create webhook configurations for event notifications.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/webhooks/events</span>
+                    <span class="description">Webhook Events</span>
+                </div>
+                <p>Get webhook events with optional filtering by status and webhook ID.</p>
+            </div>
+
+            <div class="endpoint-section">
+                <div class="endpoint-header">
+                    <span class="method">GET</span>
+                    <span class="url">/api/webhooks/deliveries</span>
+                    <span class="description">Webhook Deliveries</span>
+                </div>
+                <p>Get webhook delivery attempts with detailed status information.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Datasets</h2>
+            <ul class="datasets">
+                <li><strong>/api</strong> — Federal ridings (338 ridings)</li>
+                <li><strong>/api/qc</strong> — Quebec provincial ridings (125 ridings)</li>
+                <li><strong>/api/on</strong> — Ontario provincial ridings (124 ridings)</li>
+            </ul>
+            <p>Have a dataset you'd like to see supported? <a href="https://github.com/wra-sol/ridingLookup/issues/new">Open an issue</a> and we'll add it to the list.</p>
+            <p>Want to contribute a dataset? <a href="https://github.com/wra-sol/ridingLookup/blob/main/CONTRIBUTING.md">Read the contribution guidelines</a> and submit a pull request.</p>
+        </div>
+
+        <div class="section">
+            <h2>Authentication</h2>
+            <p>This API supports two authentication methods:</p>
+            
+            <h3>Basic Authentication</h3>
+            <pre><code class="language-bash">curl -u "username:password" "${baseUrl}/api?postal=K1A 0A6"</code></pre>
+            
+            <h3>Google Maps API Key (BYOK)</h3>
+            <p>Use your own Google Maps API key to bypass basic authentication:</p>
+            <pre><code class="language-bash">curl -H "X-Google-API-Key: YOUR_KEY" "${baseUrl}/api?address=123 Main St"</code></pre>
+            
+            <div class="note">
+                <strong>Note:</strong> When using the X-Google-API-Key header, basic authentication is automatically bypassed, allowing users to use their own Google API key without needing the configured basic auth credentials.
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Rate Limiting & Performance</h2>
+            <div class="rate-limits">
+                <h4>Rate Limits</h4>
+                <div class="rate-limit-item">
+                    <span class="rate-limit-type">Standard Requests</span>
+                    <span class="rate-limit-value">100 requests/minute</span>
+                </div>
+                <div class="rate-limit-item">
+                    <span class="rate-limit-type">Batch Processing</span>
+                    <span class="rate-limit-value">10 requests per batch</span>
+                </div>
+                <div class="rate-limit-item">
+                    <span class="rate-limit-type">Queue Processing</span>
+                    <span class="rate-limit-value">Unlimited (async)</span>
+                </div>
+            </div>
+            
+            <h3>Timeouts</h3>
+            <ul>
+                <li><strong>Single lookups:</strong> 10s for geocoding, 5s for riding lookup</li>
+                <li><strong>Batch operations:</strong> 30s total processing time</li>
+                <li><strong>Maximum request timeout:</strong> 60s</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>Error Codes</h2>
+            <div class="error-codes">
+                <h4>Common Error Responses</h4>
+                <div class="error-code">
+                    <span class="error-code-name">INVALID_POSTAL_CODE</span>
+                    <span class="error-code-desc">Postal code format is invalid</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">GEOCODING_FAILED</span>
+                    <span class="error-code-desc">Address could not be geocoded</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">INVALID_COORDINATES</span>
+                    <span class="error-code-desc">Latitude/longitude values are invalid</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">RIDING_NOT_FOUND</span>
+                    <span class="error-code-desc">No riding found for the given location</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">RATE_LIMIT_EXCEEDED</span>
+                    <span class="error-code-desc">Too many requests, please slow down</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">AUTHENTICATION_REQUIRED</span>
+                    <span class="error-code-desc">Valid credentials or API key required</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">BATCH_SIZE_EXCEEDED</span>
+                    <span class="error-code-desc">Batch contains too many requests (max 100)</span>
+                </div>
+                <div class="error-code">
+                    <span class="error-code-name">CIRCUIT_BREAKER_OPEN</span>
+                    <span class="error-code-desc">Service temporarily unavailable due to high error rate</span>
+                </div>
+            </div>
+        </div>
+
 
         <div class="links">
-            <a href="${baseUrl}/swagger" target="_blank">Interactive API Docs (Swagger UI)</a>
-            <a href="${baseUrl}/api/docs" target="_blank">OpenAPI Spec (JSON)</a>
-            <a href="https://github.com" target="_blank">GitHub</a>
+            <a href="${baseUrl}/swagger" target="_blank">API Documentation</a>
+            <a href="${baseUrl}/api/docs" target="_blank">OpenAPI Spec</a>
+            <a href="https://github.com/wra-sol/ridingLookup" target="_blank">GitHub</a>
         </div>
     </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+    <script>
+        // Tab switching functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize Prism syntax highlighting
+            if (typeof Prism !== 'undefined') {
+                Prism.highlightAll();
+            }
+            // Get preferred language from URL params, default to curl
+            const urlParams = new URLSearchParams(window.location.search);
+            const preferredLang = urlParams.get('lang') || 'curl';
+            
+            // Function to set all examples to a specific language
+            function setAllExamplesToLanguage(lang) {
+                document.querySelectorAll('.example').forEach(example => {
+                    const tabs = example.querySelectorAll('.example-tab');
+                    const contents = example.querySelectorAll('.example-content');
+                    
+                    // Remove active classes
+                    tabs.forEach(tab => tab.classList.remove('active'));
+                    contents.forEach(content => content.classList.remove('active'));
+                    
+                    // Set preferred language as active
+                    const activeTab = example.querySelector('[data-type="' + lang + '"]');
+                    const activeContent = example.querySelector('[data-type="' + lang + '"].example-content');
+                    
+                    if (activeTab && activeContent) {
+                        activeTab.classList.add('active');
+                        activeContent.classList.add('active');
+                    } else {
+                        // Fallback to curl if preferred language not found
+                        const curlTab = example.querySelector('[data-type="curl"]');
+                        const curlContent = example.querySelector('[data-type="curl"].example-content');
+                        if (curlTab && curlContent) {
+                            curlTab.classList.add('active');
+                            curlContent.classList.add('active');
+                        }
+                    }
+                });
+            }
+            
+            // Initialize with preferred language
+            setAllExamplesToLanguage(preferredLang);
+            
+            // Add click handlers to all example tabs
+            document.querySelectorAll('.example-tab').forEach(tab => {
+                tab.addEventListener('click', function() {
+                    const type = this.getAttribute('data-type');
+                    
+                    // Update URL with language preference
+                    const url = new URL(window.location);
+                    url.searchParams.set('lang', type);
+                    window.history.replaceState({}, '', url);
+                    
+                    // Update ALL examples to use the selected language
+                    setAllExamplesToLanguage(type);
+                    
+                    // Re-highlight code after tab switch
+                    if (typeof Prism !== 'undefined') {
+                        Prism.highlightAll();
+                    }
+                });
+            });
+            
+            // Add click handlers to all response tabs
+            document.querySelectorAll('.response-tab').forEach(tab => {
+                tab.addEventListener('click', function() {
+                    const example = this.closest('.example');
+                    const type = this.getAttribute('data-type');
+                    
+                    // Update response tabs in this example only
+                    example.querySelectorAll('.response-tab').forEach(t => t.classList.remove('active'));
+                    example.querySelectorAll('.response-content').forEach(c => c.classList.remove('active'));
+                    
+                    // Activate selected tab and content
+                    this.classList.add('active');
+                    example.querySelector('[data-type="' + type + '"].response-content').classList.add('active');
+                    
+                    // Re-highlight code after response tab switch
+                    if (typeof Prism !== 'undefined') {
+                        Prism.highlightAll();
+                    }
+                });
+            });
+        });
+    </script>
 </body>
 </html>`;
 }
@@ -281,6 +1005,7 @@ export function createSwaggerUI(baseUrl: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Riding Lookup API - Swagger UI</title>
   <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@4.15.5/swagger-ui.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css">
   <style>
     html {
       box-sizing: border-box;
@@ -912,7 +1637,8 @@ export function createOpenAPISpec(baseUrl: string) {
       "/api/database/init": {
         post: {
           summary: "Initialize Spatial Database",
-          description: "Initialize the spatial database with required tables and indexes",
+          description:
+            "Initialize the spatial database with required tables and indexes",
           tags: ["Database Operations"],
           responses: {
             "200": {
@@ -923,15 +1649,15 @@ export function createOpenAPISpec(baseUrl: string) {
                     type: "object",
                     properties: {
                       success: { type: "boolean" },
-                      message: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
+                      message: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/database/sync": {
         post: {
@@ -945,15 +1671,19 @@ export function createOpenAPISpec(baseUrl: string) {
                 schema: {
                   type: "object",
                   properties: {
-                    dataset: { 
-                      type: "string", 
-                      enum: ["federalridings-2024.geojson", "quebecridings-2025.geojson", "ontarioridings-2022.geojson"],
-                      default: "federalridings-2024.geojson"
-                    }
-                  }
-                }
-              }
-            }
+                    dataset: {
+                      type: "string",
+                      enum: [
+                        "federalridings-2024.geojson",
+                        "quebecridings-2025.geojson",
+                        "ontarioridings-2022.geojson",
+                      ],
+                      default: "federalridings-2024.geojson",
+                    },
+                  },
+                },
+              },
+            },
           },
           responses: {
             "200": {
@@ -965,15 +1695,15 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       success: { type: "boolean" },
                       message: { type: "string" },
-                      dataset: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
+                      dataset: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/database/stats": {
         get: {
@@ -990,16 +1720,20 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       enabled: { type: "boolean" },
                       features: { type: "number" },
-                      lastSync: { type: "string", format: "date-time", nullable: true },
-                      status: { type: "string", enum: ["active", "disabled"] }
-                    }
-                  }
-                }
-              }
-            }
+                      lastSync: {
+                        type: "string",
+                        format: "date-time",
+                        nullable: true,
+                      },
+                      status: { type: "string", enum: ["active", "disabled"] },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/database/query": {
         get: {
@@ -1012,26 +1746,30 @@ export function createOpenAPISpec(baseUrl: string) {
               in: "query",
               description: "Latitude",
               required: true,
-              schema: { type: "number", example: 45.4215 }
+              schema: { type: "number", example: 45.4215 },
             },
             {
               name: "lon",
               in: "query",
               description: "Longitude",
               required: true,
-              schema: { type: "number", example: -75.6972 }
+              schema: { type: "number", example: -75.6972 },
             },
             {
               name: "dataset",
               in: "query",
               description: "Dataset to query",
               required: false,
-              schema: { 
-                type: "string", 
-                enum: ["federalridings-2024.geojson", "quebecridings-2025.geojson", "ontarioridings-2022.geojson"],
-                default: "federalridings-2024.geojson"
-              }
-            }
+              schema: {
+                type: "string",
+                enum: [
+                  "federalridings-2024.geojson",
+                  "quebecridings-2025.geojson",
+                  "ontarioridings-2022.geojson",
+                ],
+                default: "federalridings-2024.geojson",
+              },
+            },
           ],
           responses: {
             "200": {
@@ -1043,19 +1781,20 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       type: { type: "string" },
                       properties: { type: "object" },
-                      geometry: { type: "object" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      geometry: { type: "object" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/api/boundaries/lookup": {
         get: {
           summary: "Lookup Boundaries by Coordinates",
-          description: "Find boundaries using coordinates with optional dataset selection",
+          description:
+            "Find boundaries using coordinates with optional dataset selection",
           tags: ["Boundaries"],
           parameters: [
             {
@@ -1063,26 +1802,30 @@ export function createOpenAPISpec(baseUrl: string) {
               in: "query",
               description: "Latitude",
               required: true,
-              schema: { type: "number", example: 45.4215 }
+              schema: { type: "number", example: 45.4215 },
             },
             {
               name: "lon",
               in: "query",
               description: "Longitude",
               required: true,
-              schema: { type: "number", example: -75.6972 }
+              schema: { type: "number", example: -75.6972 },
             },
             {
               name: "dataset",
               in: "query",
               description: "Dataset to search",
               required: false,
-              schema: { 
-                type: "string", 
-                enum: ["federalridings-2024.geojson", "quebecridings-2025.geojson", "ontarioridings-2022.geojson"],
-                default: "federalridings-2024.geojson"
-              }
-            }
+              schema: {
+                type: "string",
+                enum: [
+                  "federalridings-2024.geojson",
+                  "quebecridings-2025.geojson",
+                  "ontarioridings-2022.geojson",
+                ],
+                default: "federalridings-2024.geojson",
+              },
+            },
           ],
           responses: {
             "200": {
@@ -1094,14 +1837,14 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       riding: { type: "string" },
                       properties: { type: "object" },
-                      source: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      source: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/api/boundaries/all": {
         get: {
@@ -1114,26 +1857,35 @@ export function createOpenAPISpec(baseUrl: string) {
               in: "query",
               description: "Dataset to retrieve",
               required: false,
-              schema: { 
-                type: "string", 
-                enum: ["federalridings-2024.geojson", "quebecridings-2025.geojson", "ontarioridings-2022.geojson"],
-                default: "federalridings-2024.geojson"
-              }
+              schema: {
+                type: "string",
+                enum: [
+                  "federalridings-2024.geojson",
+                  "quebecridings-2025.geojson",
+                  "ontarioridings-2022.geojson",
+                ],
+                default: "federalridings-2024.geojson",
+              },
             },
             {
               name: "limit",
               in: "query",
               description: "Number of results to return",
               required: false,
-              schema: { type: "number", default: 100, minimum: 1, maximum: 1000 }
+              schema: {
+                type: "number",
+                default: 100,
+                minimum: 1,
+                maximum: 1000,
+              },
             },
             {
               name: "offset",
               in: "query",
               description: "Number of results to skip",
               required: false,
-              schema: { type: "number", default: 0, minimum: 0 }
-            }
+              schema: { type: "number", default: 0, minimum: 0 },
+            },
           ],
           responses: {
             "200": {
@@ -1150,23 +1902,24 @@ export function createOpenAPISpec(baseUrl: string) {
                           properties: {
                             type: { type: "string" },
                             properties: { type: "object" },
-                            geometry: { type: "object" }
-                          }
-                        }
+                            geometry: { type: "object" },
+                          },
+                        },
                       },
-                      total: { type: "number" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      total: { type: "number" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/api/boundaries/config": {
         get: {
           summary: "Get Boundaries Configuration",
-          description: "Get configuration information for boundaries processing",
+          description:
+            "Get configuration information for boundaries processing",
           tags: ["Boundaries"],
           responses: {
             "200": {
@@ -1181,20 +1934,21 @@ export function createOpenAPISpec(baseUrl: string) {
                       batchInsertSize: { type: "number" },
                       datasets: {
                         type: "array",
-                        items: { type: "string" }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                        items: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/api/geocoding/batch/status": {
         get: {
           summary: "Get Geocoding Batch Status",
-          description: "Get status and configuration of batch geocoding functionality",
+          description:
+            "Get status and configuration of batch geocoding functionality",
           tags: ["Geocoding"],
           responses: {
             "200": {
@@ -1210,14 +1964,14 @@ export function createOpenAPISpec(baseUrl: string) {
                       retryAttempts: { type: "number" },
                       fallbackToIndividual: { type: "boolean" },
                       hasGoogleApiKey: { type: "boolean" },
-                      timestamp: { type: "number" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      timestamp: { type: "number" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/api/cache/warm": {
         post: {
@@ -1238,14 +1992,14 @@ export function createOpenAPISpec(baseUrl: string) {
                         properties: {
                           lat: { type: "number" },
                           lon: { type: "number" },
-                          postal: { type: "string" }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+                          postal: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
           responses: {
             "200": {
@@ -1257,15 +2011,15 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       message: { type: "string" },
                       locations: { type: "number" },
-                      timestamp: { type: "number" }
-                    }
-                  }
-                }
-              }
-            }
+                      timestamp: { type: "number" },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/webhooks": {
         get: {
@@ -1287,23 +2041,26 @@ export function createOpenAPISpec(baseUrl: string) {
                           properties: {
                             id: { type: "string" },
                             url: { type: "string" },
-                            events: { type: "array", items: { type: "string" } },
+                            events: {
+                              type: "array",
+                              items: { type: "string" },
+                            },
                             secret: { type: "string", nullable: true },
                             createdAt: { type: "number" },
                             lastDelivery: { type: "number", nullable: true },
                             failureCount: { type: "number" },
                             maxFailures: { type: "number" },
-                            active: { type: "boolean" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+                            active: { type: "boolean" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
+          security: [{ basicAuth: [] }],
         },
         post: {
           summary: "Create Webhook",
@@ -1317,17 +2074,20 @@ export function createOpenAPISpec(baseUrl: string) {
                   type: "object",
                   properties: {
                     url: { type: "string", format: "uri" },
-                    events: { 
-                      type: "array", 
+                    events: {
+                      type: "array",
                       items: { type: "string" },
-                      example: ["batch.completed", "batch.failed"]
+                      example: ["batch.completed", "batch.failed"],
                     },
-                    secret: { type: "string", description: "Optional webhook secret" }
+                    secret: {
+                      type: "string",
+                      description: "Optional webhook secret",
+                    },
                   },
-                  required: ["url", "events"]
-                }
-              }
-            }
+                  required: ["url", "events"],
+                },
+              },
+            },
           },
           responses: {
             "200": {
@@ -1338,15 +2098,15 @@ export function createOpenAPISpec(baseUrl: string) {
                     type: "object",
                     properties: {
                       webhookId: { type: "string" },
-                      message: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
+                      message: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/webhooks/events": {
         get: {
@@ -1359,15 +2119,18 @@ export function createOpenAPISpec(baseUrl: string) {
               in: "query",
               description: "Filter by event status",
               required: false,
-              schema: { type: "string", enum: ["pending", "delivered", "failed"] }
+              schema: {
+                type: "string",
+                enum: ["pending", "delivered", "failed"],
+              },
             },
             {
               name: "webhookId",
               in: "query",
               description: "Filter by webhook ID",
               required: false,
-              schema: { type: "string" }
-            }
+              schema: { type: "string" },
+            },
           ],
           responses: {
             "200": {
@@ -1387,18 +2150,18 @@ export function createOpenAPISpec(baseUrl: string) {
                             eventType: { type: "string" },
                             status: { type: "string" },
                             payload: { type: "object" },
-                            createdAt: { type: "number" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+                            createdAt: { type: "number" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/api/webhooks/deliveries": {
         get: {
@@ -1411,15 +2174,18 @@ export function createOpenAPISpec(baseUrl: string) {
               in: "query",
               description: "Filter by webhook ID",
               required: false,
-              schema: { type: "string" }
+              schema: { type: "string" },
             },
             {
               name: "status",
               in: "query",
               description: "Filter by delivery status",
               required: false,
-              schema: { type: "string", enum: ["pending", "success", "failed"] }
-            }
+              schema: {
+                type: "string",
+                enum: ["pending", "success", "failed"],
+              },
+            },
           ],
           responses: {
             "200": {
@@ -1441,23 +2207,24 @@ export function createOpenAPISpec(baseUrl: string) {
                             responseCode: { type: "number", nullable: true },
                             responseBody: { type: "string", nullable: true },
                             attemptCount: { type: "number" },
-                            createdAt: { type: "number" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+                            createdAt: { type: "number" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
           },
-          security: [{ basicAuth: [] }]
-        }
+          security: [{ basicAuth: [] }],
+        },
       },
       "/health": {
         get: {
           summary: "Health Check",
-          description: "Get comprehensive health status including metrics, circuit breakers, and cache warming status",
+          description:
+            "Get comprehensive health status including metrics, circuit breakers, and cache warming status",
           tags: ["System"],
           responses: {
             "200": {
@@ -1467,18 +2234,21 @@ export function createOpenAPISpec(baseUrl: string) {
                   schema: {
                     type: "object",
                     properties: {
-                      status: { type: "string", enum: ["healthy", "unhealthy"] },
+                      status: {
+                        type: "string",
+                        enum: ["healthy", "unhealthy"],
+                      },
                       timestamp: { type: "number" },
                       metrics: { type: "object" },
                       circuitBreakers: { type: "object" },
-                      cacheWarming: { type: "object" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      cacheWarming: { type: "object" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/metrics": {
         get: {
@@ -1498,21 +2268,21 @@ export function createOpenAPISpec(baseUrl: string) {
                         properties: {
                           total: { type: "number" },
                           errors: { type: "number" },
-                          errorRate: { type: "number" }
-                        }
+                          errorRate: { type: "number" },
+                        },
                       },
                       geocoding: { type: "object" },
                       r2: { type: "object" },
                       lookup: { type: "object" },
                       batch: { type: "object" },
-                      webhooks: { type: "object" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      webhooks: { type: "object" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/cache-warming": {
         get: {
@@ -1539,21 +2309,22 @@ export function createOpenAPISpec(baseUrl: string) {
                         properties: {
                           enabled: { type: "boolean" },
                           interval: { type: "number" },
-                          batchSize: { type: "number" }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                          batchSize: { type: "number" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/webhooks": {
         get: {
           summary: "List Webhooks (Legacy)",
-          description: "Legacy endpoint for listing webhooks - use /api/webhooks instead",
+          description:
+            "Legacy endpoint for listing webhooks - use /api/webhooks instead",
           tags: ["Webhook Management"],
           responses: {
             "200": {
@@ -1565,20 +2336,21 @@ export function createOpenAPISpec(baseUrl: string) {
                     properties: {
                       webhooks: {
                         type: "array",
-                        items: { type: "object" }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                        items: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/webhooks/events": {
         get: {
           summary: "Get Webhook Events (Legacy)",
-          description: "Legacy endpoint for webhook events - use /api/webhooks/events instead",
+          description:
+            "Legacy endpoint for webhook events - use /api/webhooks/events instead",
           tags: ["Webhook Management"],
           responses: {
             "200": {
@@ -1588,19 +2360,20 @@ export function createOpenAPISpec(baseUrl: string) {
                   schema: {
                     type: "object",
                     properties: {
-                      events: { type: "array" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      events: { type: "array" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       "/webhooks/deliveries": {
         get: {
           summary: "Get Webhook Deliveries (Legacy)",
-          description: "Legacy endpoint for webhook deliveries - use /api/webhooks/deliveries instead",
+          description:
+            "Legacy endpoint for webhook deliveries - use /api/webhooks/deliveries instead",
           tags: ["Webhook Management"],
           responses: {
             "200": {
@@ -1610,14 +2383,14 @@ export function createOpenAPISpec(baseUrl: string) {
                   schema: {
                     type: "object",
                     properties: {
-                      deliveries: { type: "array" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                      deliveries: { type: "array" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
     securitySchemes: {
