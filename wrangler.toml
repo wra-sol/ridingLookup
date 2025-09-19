@@ -11,8 +11,7 @@ bucket_name = "ridings"
 
 [[kv_namespaces]]
 binding = "GEOCODING_CACHE"
-id = "your-geocoding-cache-id"
-preview_id = "your-preview-geocoding-cache-id"
+id = "e1ebe0d5eb39443e89d854526d97a6b6"
 
 [[durable_objects.bindings]]
 name = "QUEUE_MANAGER"
