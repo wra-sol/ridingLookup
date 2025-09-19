@@ -19,7 +19,7 @@ class_name = "QueueManagerDO"
 
 [[migrations]]
 tag = "v1"
-new_classes = [ "QueueManagerDO" ]
+new_sqlite_classes = [ "QueueManagerDO" ]
 
 [vars]
 # Optional: set a geocoding provider. Supported: "nominatim" (default) or "mapbox"
