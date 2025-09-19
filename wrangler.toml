@@ -18,6 +18,10 @@ preview_id = "your-preview-geocoding-cache-id"
 name = "QUEUE_MANAGER"
 class_name = "QueueManagerDO"
 
+[[migrations]]
+tag = "v1"
+new_classes = [ "QueueManagerDO" ]
+
 [vars]
 # Optional: set a geocoding provider. Supported: "nominatim" (default) or "mapbox"
 # For Mapbox, set MAPBOX_TOKEN as a secret: wrangler secret put MAPBOX_TOKEN
