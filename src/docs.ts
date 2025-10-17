@@ -814,7 +814,7 @@ print(data)</code></pre>
                 <li><strong>/api/on</strong> — Ontario provincial ridings (124 ridings)</li>
             </ul>
             <p>Have a dataset you'd like to see supported? <a href="https://github.com/wra-sol/ridingLookup/issues/new">Open an issue</a> and we'll add it to the list.</p>
-            <p>Want to contribute a dataset? <a href="https://github.com/wra-sol/ridingLookup/blob/main/CONTRIBUTING.md">Read the contribution guidelines</a> and submit a pull request.</p>
+            <p>Want to contribute a dataset? <a href="https://github.com/wra-sol/ridingLookup/blob/main/docs/CONTRIBUTING.md">Read the contribution guidelines</a> and submit a pull request.</p>
         </div>
 
         <div class="section">
