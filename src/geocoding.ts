@@ -93,7 +93,16 @@ export async function setCachedGeocoding(env: Env, cacheKey: string, lon: number
   }
 }
 
-// Retry utility function
+// Non-retriable error type
+class NonRetriableError extends Error {
+  nonRetriable: boolean;
+  constructor(message: string) {
+    super(message);
+    this.nonRetriable = true;
+  }
+}
+
+// Retry utility function with jitter and non-retriable support
 async function withRetry<T>(
   fn: () => Promise<T>,
   config: typeof DEFAULT_RETRY_CONFIG,
@@ -103,11 +112,21 @@ async function withRetry<T>(
   
   for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
     try {
-      return await fn();
+      const result = await fn();
+      if (attempt > 1) {
+      }
+      return result;
     } catch (error) {
       lastError = error as Error;
       
+      // Do not retry non-retriable errors
+      if ((lastError as any)?.nonRetriable) {
+        console.error(`[GEOCODING] ${operation} failed with non-retriable error:`, lastError.message);
+        throw lastError;
+      }
+      
       if (attempt === config.maxAttempts) {
+        console.error(`[GEOCODING] ${operation} failed after ${config.maxAttempts} attempts:`, lastError.message);
         throw lastError;
       }
       
@@ -115,9 +134,10 @@ async function withRetry<T>(
         config.baseDelay * Math.pow(config.backoffMultiplier, attempt - 1),
         config.maxDelay
       );
+      const jitteredDelay = delay + Math.random() * 1000;
       
-      console.warn(`${operation} attempt ${attempt} failed, retrying in ${delay}ms:`, lastError.message);
-      await new Promise(resolve => setTimeout(resolve, delay));
+      console.warn(`[GEOCODING] ${operation} attempt ${attempt} failed, retrying in ${Math.round(jitteredDelay)}ms:`, lastError.message);
+      await new Promise(resolve => setTimeout(resolve, jitteredDelay));
     }
   }
   
@@ -185,18 +205,53 @@ export async function geocodeIfNeeded(
           const params = new URLSearchParams({ key });
           // Prefer structured components when available
           const components: string[] = [];
-          if (qp.postal) components.push(`postal_code:${qp.postal}`);
+          if (qp.postal) components.push(`postal_code:${qp.postal.replace(/\s+/g, '')}`);
           if (qp.city) components.push(`locality:${qp.city}`);
           if (qp.state) components.push(`administrative_area:${qp.state}`);
-          if (qp.country) components.push(`country:${qp.country}`);
+          // Default to Canada unless caller specifies
+          const country = (qp.country || 'CA').toUpperCase();
+          components.push(`country:${country}`);
           if (components.length) params.set("components", components.join("|"));
           if (qp.address) params.set("address", qp.address);
+          // Region bias for Canada
+          params.set('region', 'ca');
 
           const url = `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`;
           const resp = await fetch(url, { headers: { "User-Agent": "riding-lookup/1.0" } });
           if (!resp.ok) throw new Error(`Google error: ${resp.status}`);
           const data = await resp.json() as GoogleGeocodeResponse;
-          if (data.status !== "OK" || !data.results?.length) throw new Error("No results from Google");
+          // Handle zero results or API errors without pointless retries; try Nominatim fallback immediately
+          if (data.status === 'ZERO_RESULTS' || data.status === 'REQUEST_DENIED' || data.status === 'INVALID_REQUEST' || !data.results?.length) {
+            console.error(`[GEOCODING] Google API failed (${data.status || 'no results'}), falling back to Nominatim`);
+            // Fallback to Nominatim (same shaping as below)
+            const nominatimParams = new URLSearchParams({ format: "jsonv2", limit: "1", country: "canada" });
+            if (qp.address) nominatimParams.set("street", qp.address);
+            if (qp.city) nominatimParams.set("city", qp.city);
+            if (qp.state) nominatimParams.set("state", qp.state);
+            if (qp.country) nominatimParams.set("country", qp.country);
+            if (qp.postal) nominatimParams.set("postalcode", qp.postal);
+            if (![qp.address, qp.city, qp.state, qp.country, qp.postal].some(Boolean)) {
+              nominatimParams.set("q", query);
+            }
+            const nominatimUrl = `https://nominatim.openstreetmap.org/search?${nominatimParams.toString()}`;
+            const nomResp = await fetch(nominatimUrl, { headers: { "User-Agent": "riding-lookup/1.0" } });
+            if (nomResp.ok) {
+              const results = await nomResp.json() as NominatimResult[];
+              const first = results?.[0];
+              if (first) {
+                geocodeResult = { lon: Number(first.lon), lat: Number(first.lat) };
+                return geocodeResult;
+              }
+            }
+            console.error(`[GEOCODING] Nominatim fallback also failed, no results found`);
+            throw new NonRetriableError("No results from Google");
+          }
+          
+          // Handle other Google API error statuses
+          if (data.status === 'OVER_QUERY_LIMIT' || data.status === 'UNKNOWN_ERROR') {
+            throw new Error(`Google API error: ${data.status}`);
+          }
+          
           const loc = data.results[0].geometry.location;
           geocodeResult = { lon: loc.lng, lat: loc.lat };
         } else if (provider === "mapbox") {
@@ -222,7 +277,6 @@ export async function geocodeIfNeeded(
           if (![qp.address, qp.city, qp.state, qp.country, qp.postal].some(Boolean)) {
             nominatimParams.set("q", query);
           }
-          console.log(nominatimParams.toString());
           const nominatimUrl = `https://nominatim.openstreetmap.org/search?${nominatimParams.toString()}`;
           const resp = await fetch(nominatimUrl, { headers: { "User-Agent": "riding-lookup/1.0" } });
           if (!resp.ok) throw new Error(`Nominatim error: ${resp.status}`);
@@ -245,8 +299,10 @@ export async function geocodeIfNeeded(
       
       metrics?.incrementMetric('geocodingSuccesses');
     } catch (error) {
+      console.error(`[GEOCODING] Geocoding failed after ${Date.now() - startTime}ms:`, error instanceof Error ? error.message : 'Unknown error');
       metrics?.incrementMetric('geocodingFailures');
       if (error instanceof Error && error.message.includes('Circuit breaker is OPEN')) {
+        console.error(`[GEOCODING] Circuit breaker is OPEN for provider: ${provider}`);
         metrics?.incrementMetric('geocodingCircuitBreakerTrips');
       }
       throw error;
