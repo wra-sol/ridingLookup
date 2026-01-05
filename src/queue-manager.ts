@@ -105,42 +105,66 @@ export class QueueManager {
   private lastProcessedTime: number = Date.now();
   private processedJobsCount: number = 0;
   private stateLoadPromise: Promise<void> | null = null;
+  private stateLoaded: boolean = false;
+  private stateLoadError: Error | null = null;
 
   constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
     // Load persisted state on initialization and store the promise
-    this.stateLoadPromise = this.loadState().catch(error => {
-      console.error('Failed to load queue manager state:', error);
-    });
+    this.stateLoadPromise = this.loadStateWithRetry();
+  }
+
+  // Load state from Durable Object storage with retry logic
+  private async loadStateWithRetry(maxRetries: number = 3): Promise<void> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await this.loadState();
+        this.stateLoaded = true;
+        this.stateLoadError = null;
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        console.error(`Failed to load queue manager state (attempt ${attempt}/${maxRetries}):`, lastError);
+        
+        if (attempt < maxRetries) {
+          // Exponential backoff: wait 100ms, 200ms, 400ms
+          const delay = 100 * Math.pow(2, attempt - 1);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    
+    // All retries failed
+    this.stateLoadError = lastError;
+    console.error('Failed to load queue manager state after all retries. Operating with empty state.', lastError);
+    // Don't throw - allow the queue manager to operate with empty state rather than failing completely
   }
 
   // Load state from Durable Object storage
   private async loadState(): Promise<void> {
-    try {
-      const stored = await this.state.storage.get<{
-        jobs: [string, QueueJob][];
-        batches: [string, BatchJob][];
-        processingQueue: string[];
-        retryQueue: string[];
-        deadLetterQueue: string[];
-        priorityQueues: [number, string[]][];
-        lastProcessedTime: number;
-        processedJobsCount: number;
-      }>('queueState');
-      
-      if (stored) {
-        this.jobs = new Map(stored.jobs || []);
-        this.batches = new Map(stored.batches || []);
-        this.processingQueue = stored.processingQueue || [];
-        this.retryQueue = stored.retryQueue || [];
-        this.deadLetterQueue = stored.deadLetterQueue || [];
-        this.priorityQueues = new Map(stored.priorityQueues || []);
-        this.lastProcessedTime = stored.lastProcessedTime || Date.now();
-        this.processedJobsCount = stored.processedJobsCount || 0;
-      }
-    } catch (error) {
-      console.error('Error loading queue manager state:', error);
+    const stored = await this.state.storage.get<{
+      jobs: [string, QueueJob][];
+      batches: [string, BatchJob][];
+      processingQueue: string[];
+      retryQueue: string[];
+      deadLetterQueue: string[];
+      priorityQueues: [number, string[]][];
+      lastProcessedTime: number;
+      processedJobsCount: number;
+    }>('queueState');
+    
+    if (stored) {
+      this.jobs = new Map(stored.jobs || []);
+      this.batches = new Map(stored.batches || []);
+      this.processingQueue = stored.processingQueue || [];
+      this.retryQueue = stored.retryQueue || [];
+      this.deadLetterQueue = stored.deadLetterQueue || [];
+      this.priorityQueues = new Map(stored.priorityQueues || []);
+      this.lastProcessedTime = stored.lastProcessedTime || Date.now();
+      this.processedJobsCount = stored.processedJobsCount || 0;
     }
   }
 
@@ -247,8 +271,19 @@ export class QueueManager {
   async fetch(request: Request): Promise<Response> {
     // Ensure state is loaded before processing any requests
     if (this.stateLoadPromise) {
-      await this.stateLoadPromise;
-      this.stateLoadPromise = null; // Clear promise after first load
+      try {
+        await this.stateLoadPromise;
+      } catch (error) {
+        // Error already logged in loadStateWithRetry, but log here too for visibility
+        console.error('State load failed in fetch handler:', error);
+      } finally {
+        this.stateLoadPromise = null; // Clear promise after first load attempt
+      }
+    }
+    
+    // If state failed to load, log a warning but continue processing
+    if (this.stateLoadError && !this.stateLoaded) {
+      console.warn('Queue manager operating with empty state due to load failure. Previous jobs/batches may not be visible.');
     }
     
     const url = new URL(request.url);

@@ -1056,7 +1056,9 @@ export default {
           
           const timeoutConfig = getTimeoutConfig(env);
           const { lon, lat } = await withTimeout(
-            geocodeIfNeeded(env, sanitizedQuery, request),
+            geocodeIfNeeded(env, sanitizedQuery, request, undefined, geocodingCircuitBreaker ? {
+              execute: (key: string, fn: () => Promise<any>) => geocodingCircuitBreaker.execute(key, fn)
+            } : undefined),
             timeoutConfig.geocoding,
             "Geocoding"
           );

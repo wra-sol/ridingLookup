@@ -1,6 +1,7 @@
 import { Env, GeoJSONFeatureCollection, SpatialIndex, CacheWarmingState, QueryParams } from './types';
 import { geocodeIfNeeded } from './geocoding';
 import { TIME_CONSTANTS } from './config';
+import { geocodingCircuitBreaker } from './circuit-breaker';
 
 // Cache configuration
 export const CACHE_CONFIG = {
@@ -201,7 +202,9 @@ export async function warmCacheForPostalCode(
   try {
     // Geocode the postal code first
     const query: QueryParams = { postal: postalCode };
-    const { lon, lat } = await geocodeIfNeeded(env, query);
+    const { lon, lat } = await geocodeIfNeeded(env, query, undefined, undefined, geocodingCircuitBreaker ? {
+      execute: (key: string, fn: () => Promise<any>) => geocodingCircuitBreaker.execute(key, fn)
+    } : undefined);
     
     // Warm cache for all datasets
     return await warmCacheForLocation(env, lat, lon, `Postal Code ${postalCode}`, loadGeo, lookupRiding);
