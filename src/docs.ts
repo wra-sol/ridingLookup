@@ -1060,7 +1060,7 @@ export function createOpenAPISpec(baseUrl: string) {
     info: {
       title: "Riding Lookup API",
       description:
-        "Find Canadian federal, provincial, and territorial ridings by location. Supports multiple geocoding providers including Google Maps (BYOK), Mapbox, and Nominatim. Features Google Maps batch geocoding for optimal performance and cost efficiency. Built on Cloudflare Workers for global edge performance.",
+        "Find Canadian federal, provincial, and territorial ridings by location. Uses GeoGratis Geolocation API (Government of Canada) as the primary geocoding service, with automatic fallback to Google Maps (BYOK), Mapbox, or Nominatim when needed. Features Google Maps batch geocoding for optimal performance and cost efficiency. Built on Cloudflare Workers for global edge performance.",
       version: "1.0.0",
       contact: {
         name: "API Support",

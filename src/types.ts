@@ -8,11 +8,14 @@ export interface Env {
   BASIC_AUTH?: string;
   BATCH_QUEUE?: DurableObjectNamespace;
   QUEUE_MANAGER?: DurableObjectNamespace;
+  CIRCUIT_BREAKER_DO?: DurableObjectNamespace;
   BATCH_SIZE?: number;
   BATCH_TIMEOUT?: number;
   RATE_LIMIT?: number;
   GEOCODING_CACHE?: KVNamespace;
+  WEBHOOKS?: KVNamespace;
   RIDING_DB?: D1Database;
+  SPATIAL_DB_ENABLED?: string; // 'true' or '1' to enable spatial database
 }
 
 // Geocoding interfaces
@@ -46,6 +49,24 @@ export interface GoogleGeocodeResponse {
   status: string; 
   results: GoogleGeocodeResult[]; 
 }
+
+// GeoGratis Geolocation API interfaces
+export interface GeoGratisGeometry {
+  type: string;
+  coordinates: number[];
+}
+
+export interface GeoGratisResult {
+  title: string;
+  qualifier?: string;
+  type?: string;
+  geometry: GeoGratisGeometry;
+  bbox?: number[];
+  score?: number;
+  component?: Record<string, unknown>;
+}
+
+export type GeoGratisResponse = GeoGratisResult[];
 
 // Google Maps Batch Geocoding API types
 export interface GoogleBatchGeocodeRequest {

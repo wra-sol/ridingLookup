@@ -104,10 +104,62 @@ export class QueueManager {
   };
   private lastProcessedTime: number = Date.now();
   private processedJobsCount: number = 0;
+  private stateLoadPromise: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
+    // Load persisted state on initialization and store the promise
+    this.stateLoadPromise = this.loadState().catch(error => {
+      console.error('Failed to load queue manager state:', error);
+    });
+  }
+
+  // Load state from Durable Object storage
+  private async loadState(): Promise<void> {
+    try {
+      const stored = await this.state.storage.get<{
+        jobs: [string, QueueJob][];
+        batches: [string, BatchJob][];
+        processingQueue: string[];
+        retryQueue: string[];
+        deadLetterQueue: string[];
+        priorityQueues: [number, string[]][];
+        lastProcessedTime: number;
+        processedJobsCount: number;
+      }>('queueState');
+      
+      if (stored) {
+        this.jobs = new Map(stored.jobs || []);
+        this.batches = new Map(stored.batches || []);
+        this.processingQueue = stored.processingQueue || [];
+        this.retryQueue = stored.retryQueue || [];
+        this.deadLetterQueue = stored.deadLetterQueue || [];
+        this.priorityQueues = new Map(stored.priorityQueues || []);
+        this.lastProcessedTime = stored.lastProcessedTime || Date.now();
+        this.processedJobsCount = stored.processedJobsCount || 0;
+      }
+    } catch (error) {
+      console.error('Error loading queue manager state:', error);
+    }
+  }
+
+  // Save state to Durable Object storage
+  private async saveState(): Promise<void> {
+    try {
+      await this.state.storage.put('queueState', {
+        jobs: Array.from(this.jobs.entries()),
+        batches: Array.from(this.batches.entries()),
+        processingQueue: this.processingQueue,
+        retryQueue: this.retryQueue,
+        deadLetterQueue: this.deadLetterQueue,
+        priorityQueues: Array.from(this.priorityQueues.entries()),
+        lastProcessedTime: this.lastProcessedTime,
+        processedJobsCount: this.processedJobsCount
+      });
+    } catch (error) {
+      console.error('Error saving queue manager state:', error);
+    }
   }
 
   // Priority queue management
@@ -193,6 +245,12 @@ export class QueueManager {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // Ensure state is loaded before processing any requests
+    if (this.stateLoadPromise) {
+      await this.stateLoadPromise;
+      this.stateLoadPromise = null; // Clear promise after first load
+    }
+    
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -235,11 +293,29 @@ export class QueueManager {
       return new Response('Method not allowed', { status: 405 });
     }
 
+    // Check request body size (limit to 10MB)
+    const contentLength = request.headers.get('content-length');
+    if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
+      return new Response(JSON.stringify({ error: 'Request body too large. Maximum size is 10MB' }), {
+        status: 413,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const body = await request.json() as { requests: BatchLookupRequest[]; priority?: number; tags?: string[] };
     const { requests, priority = 1, tags = [] } = body;
 
     if (!Array.isArray(requests) || requests.length === 0) {
       return new Response(JSON.stringify({ error: 'Invalid requests array' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Validate batch size (maximum 100 requests)
+    const MAX_BATCH_SIZE = 100;
+    if (requests.length > MAX_BATCH_SIZE) {
+      return new Response(JSON.stringify({ error: `Batch size exceeds maximum of ${MAX_BATCH_SIZE} requests` }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
@@ -292,6 +368,7 @@ export class QueueManager {
 
     this.batches.set(batchId, batchJob);
     this.updateStats();
+    await this.saveState(); // Persist state after adding batch
 
     return new Response(JSON.stringify({
       batchId,
@@ -427,6 +504,7 @@ export class QueueManager {
     }
 
     this.updateStats();
+    await this.saveState(); // Persist state after retrying jobs
 
     return new Response(JSON.stringify({
       message: `Retried ${retriedCount} jobs`,
@@ -442,7 +520,10 @@ export class QueueManager {
     }
 
     const body = await request.json() as { maxJobs?: number; priority?: number | null };
-    const { maxJobs = 10, priority = null } = body;
+    // Validate and clamp maxJobs (1-100)
+    const rawMaxJobs = body.maxJobs ?? 10;
+    const maxJobs = Math.max(1, Math.min(Math.floor(rawMaxJobs), 100));
+    const priority = body.priority ?? null;
 
     const jobsToProcess: string[] = [];
     
@@ -527,6 +608,7 @@ export class QueueManager {
     this.lastProcessedTime = Date.now();
 
     this.updateStats();
+    await this.saveState(); // Persist state after processing jobs
 
     return new Response(JSON.stringify({
       processedJobs: results.length,
@@ -668,8 +750,9 @@ export class QueueManager {
     }
 
     // Calculate throughput (jobs per minute)
-    const timeSinceLastProcessed = Date.now() - this.lastProcessedTime;
-    const throughput = timeSinceLastProcessed > 0 ? 
+    // Use a minimum time window of 1 second to avoid division by zero
+    const timeSinceLastProcessed = Math.max(Date.now() - this.lastProcessedTime, 1000);
+    const throughput = this.processedJobsCount > 0 && timeSinceLastProcessed > 0 ? 
       (this.processedJobsCount * 60000) / timeSinceLastProcessed : 0;
 
     this.stats = {
@@ -779,6 +862,7 @@ export class QueueManager {
     }
 
     this.updateStats();
+    await this.saveState(); // Persist state after retrying dead letter jobs
 
     return new Response(JSON.stringify({
       message: `Retried ${retriedCount} dead letter jobs`,

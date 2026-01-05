@@ -145,16 +145,24 @@ database_id = "your-database-id"
 
 #### 7) Configure geocoding providers (optional)
 
-**Default: Nominatim** (no API key required)
+**Primary: GeoGratis** (no API key required)
+- The service **always** uses GeoGratis Geolocation API first (https://geogratis.gc.ca/services/geolocation/en/locate)
+- No configuration needed, works out of the box
+- Automatically falls back to other providers if GeoGratis fails, returns `INTERPOLATED_POSITION`, or has poor scoring (< 0.5)
+
+**Fallback Providers:**
+The service falls back to the configured provider when GeoGratis is unavailable or returns low-quality results.
+
+**Default Fallback: Nominatim** (no API key required)
 - No configuration needed, works out of the box
 
-**Mapbox Geocoding:**
+**Mapbox Geocoding (Fallback):**
 ```bash
 wrangler secret put MAPBOX_TOKEN
 ```
 Set `GEOCODER = "mapbox"` in `wrangler.toml`.
 
-**Google Maps Geocoding:**
+**Google Maps Geocoding (Fallback):**
 ```bash
 wrangler secret put GOOGLE_MAPS_KEY
 ```
@@ -169,6 +177,12 @@ Set basic authentication for admin endpoints:
 wrangler secret put BASIC_AUTH
 # Enter: username:password (will be base64 encoded automatically)
 ```
+
+**Security Note: Authentication Bypass with Google API Key**
+- If a request includes the `X-Google-API-Key` header, basic authentication is automatically bypassed
+- This allows users to use their own Google Maps API key without needing the configured basic auth credentials
+- **Important**: If a Google API key is compromised, the attacker will have full access to the API
+- Consider implementing additional rate limiting or access controls per API key if needed
 
 #### 9) Set environment variables
 Configure in `wrangler.toml` under `[vars]`:
@@ -210,8 +224,15 @@ curl -X POST https://your-worker.your-subdomain.workers.dev/api/database/sync \
 
 #### Intelligent Caching
 - **Multi-layer caching**: LRU caches for GeoJSON data, spatial indexes, and geocoding results
-- **Automatic cache warming**: Background cache warming every 6 hours
+- **Automatic cache warming**: Background cache warming every 6 hours (currently uses setInterval; consider migrating to Cloudflare Cron Triggers for production)
 - **Circuit breakers**: Automatic failover when external services are unavailable
+
+**Note on Cache Warming**: The current implementation uses `setInterval` for cache warming. For production deployments, consider using Cloudflare Cron Triggers by adding to `wrangler.toml`:
+```toml
+[triggers]
+crons = ["0 */6 * * *"]  # Every 6 hours
+```
+Then handle the scheduled event in the worker's `scheduled` handler instead of using `setInterval`.
 
 #### Spatial Optimization
 - **Spatial indexing**: Bounding box pre-filtering for faster point-in-polygon tests
@@ -264,4 +285,4 @@ Built-in metrics tracking:
 - **Federal ridings**: 2024 electoral boundaries from Elections Canada
 - **Quebec provincial**: 2025 electoral boundaries  
 - **Ontario provincial**: 2022 electoral boundaries
-- **Geocoding**: Support for Nominatim, Mapbox, and Google Maps APIs
+- **Geocoding**: Primary service is GeoGratis Geolocation API (Government of Canada), with fallback to Nominatim, Mapbox, and Google Maps APIs

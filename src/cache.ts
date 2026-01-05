@@ -1,16 +1,17 @@
 import { Env, GeoJSONFeatureCollection, SpatialIndex, CacheWarmingState, QueryParams } from './types';
 import { geocodeIfNeeded } from './geocoding';
+import { TIME_CONSTANTS } from './config';
 
 // Cache configuration
 export const CACHE_CONFIG = {
   MAX_SIZE: 10, // Maximum number of datasets to cache
-  MAX_AGE: 24 * 60 * 60 * 1000, // 24 hours in milliseconds
+  MAX_AGE: TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS,
 };
 
 // Cache warming configuration
 export const CACHE_WARMING_CONFIG = {
   ENABLED: true,
-  WARMING_INTERVAL: 6 * 60 * 60 * 1000, // 6 hours
+  WARMING_INTERVAL: TIME_CONSTANTS.SIX_HOURS_MS,
   BATCH_SIZE: 5,
   POPULAR_LOCATIONS: [
     { name: "Toronto", lat: 43.6532, lon: -79.3832 },
@@ -112,7 +113,24 @@ export class LRUCache<K, V> {
   }
 }
 
-// Global cache instances
+// Global cache instances with size limits to prevent memory leaks
+const MAX_GLOBAL_CACHE_SIZE = 5; // Maximum entries per global cache
+
+// Helper to enforce size limits on Maps
+function enforceCacheSizeLimit<K, V>(cache: Map<K, V>, maxSize: number): void {
+  if (cache.size > maxSize) {
+    // Remove oldest entries (first in Map iteration order)
+    const entriesToDelete = cache.size - maxSize;
+    let deleted = 0;
+    for (const key of cache.keys()) {
+      if (deleted >= entriesToDelete) break;
+      cache.delete(key);
+      deleted++;
+    }
+  }
+}
+
+// Global cache instances (kept for backward compatibility, but prefer LRU caches)
 export const geoCache = new Map<string, GeoJSONFeatureCollection>();
 export const spatialIndexCache = new Map<string, SpatialIndex>();
 export const simplifiedBoundariesCache = new Map<string, any>();
@@ -132,6 +150,9 @@ export const cacheWarmingState: CacheWarmingState = {
   nextWarmingTime: 0,
   lastError: undefined
 };
+
+// Lock for atomic cache warming state management
+let cacheWarmingLock = false;
 
 // Cache warming functions
 export async function warmCacheForLocation(
@@ -195,16 +216,29 @@ export async function performCacheWarming(
   loadGeo: (env: Env, r2Key: string) => Promise<void>,
   lookupRiding: (env: Env, pathname: string, lon: number, lat: number) => Promise<any>
 ): Promise<void> {
-  if (!CACHE_WARMING_CONFIG.ENABLED || cacheWarmingState.isRunning) {
+  if (!CACHE_WARMING_CONFIG.ENABLED) {
     return;
   }
 
+  // Atomic check and set using lock to prevent race conditions
+  if (cacheWarmingLock || cacheWarmingState.isRunning) {
+    return;
+  }
+  
   const now = Date.now();
   if (now < cacheWarmingState.nextWarmingTime) {
     return;
   }
 
+  // Acquire lock atomically
+  cacheWarmingLock = true;
+  if (cacheWarmingState.isRunning) {
+    cacheWarmingLock = false;
+    return;
+  }
+  
   cacheWarmingState.isRunning = true;
+  cacheWarmingLock = false;
   cacheWarmingState.currentBatch = 0;
   cacheWarmingState.successCount = 0;
   cacheWarmingState.failureCount = 0;
@@ -270,7 +304,9 @@ export async function performCacheWarming(
     console.error("Cache warming process failed:", error);
     cacheWarmingState.lastError = error instanceof Error ? error.message : 'Unknown error';
   } finally {
+    // Release lock and reset running state
     cacheWarmingState.isRunning = false;
+    cacheWarmingLock = false;
   }
 }
 
@@ -323,6 +359,7 @@ export function getCachedGeoJSON(key: string): GeoJSONFeatureCollection | undefi
 export function setCachedGeoJSON(key: string, data: GeoJSONFeatureCollection): void {
   geoCacheLRU.set(key, data);
   geoCache.set(key, data);
+  enforceCacheSizeLimit(geoCache, MAX_GLOBAL_CACHE_SIZE);
 }
 
 export function getCachedSpatialIndex(key: string): SpatialIndex | undefined {
@@ -345,6 +382,7 @@ export function getCachedSpatialIndex(key: string): SpatialIndex | undefined {
 export function setCachedSpatialIndex(key: string, data: SpatialIndex): void {
   spatialIndexCacheLRU.set(key, data);
   spatialIndexCache.set(key, data);
+  enforceCacheSizeLimit(spatialIndexCache, MAX_GLOBAL_CACHE_SIZE);
 }
 
 export function getCachedSimplifiedBoundary(cacheKey: string): any | undefined {
@@ -353,4 +391,5 @@ export function getCachedSimplifiedBoundary(cacheKey: string): any | undefined {
 
 export function setCachedSimplifiedBoundary(cacheKey: string, geometry: any): void {
   simplifiedBoundariesCache.set(cacheKey, geometry);
+  enforceCacheSizeLimit(simplifiedBoundariesCache, MAX_GLOBAL_CACHE_SIZE);
 }

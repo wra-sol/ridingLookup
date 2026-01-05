@@ -1,4 +1,5 @@
-import { WebhookConfig, WebhookEvent, WebhookDelivery } from './types';
+import { Env, WebhookConfig, WebhookEvent, WebhookDelivery } from './types';
+import { TIME_CONSTANTS } from './config';
 
 // Webhook configuration
 export const WEBHOOK_CONFIG = {
@@ -7,14 +8,20 @@ export const WEBHOOK_CONFIG = {
   RETRY_DELAY: 5000, // 5 seconds
   TIMEOUT: 30000, // 30 seconds
   MAX_WEBHOOKS: 10,
-  CLEANUP_INTERVAL: 24 * 60 * 60 * 1000, // 24 hours
-  MAX_EVENT_AGE: 7 * 24 * 60 * 60 * 1000 // 7 days
+  CLEANUP_INTERVAL: TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS,
+  MAX_EVENT_AGE: TIME_CONSTANTS.SEVEN_DAYS_MS
 };
 
-// In-memory storage for webhook data
-export const webhookConfigs = new Map<string, WebhookConfig>();
-export const webhookEvents = new Map<string, WebhookEvent>();
-export const webhookDeliveries = new Map<string, WebhookDelivery>();
+// KV storage key prefixes
+const WEBHOOK_CONFIG_PREFIX = 'webhook:config:';
+const WEBHOOK_EVENT_PREFIX = 'webhook:event:';
+const WEBHOOK_DELIVERY_PREFIX = 'webhook:delivery:';
+const WEBHOOK_INDEX_KEY = 'webhook:index';
+const WEBHOOK_EVENT_INDEX_KEY = 'webhook:event:index';
+const WEBHOOK_DELIVERY_INDEX_KEY = 'webhook:delivery:index';
+
+// Track if webhook processing has been initialized
+let webhookProcessingInitialized = false;
 
 // ID generation functions
 export function generateWebhookId(): string {
@@ -29,8 +36,73 @@ export function generateDeliveryId(): string {
   return `delivery_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// Helper functions for KV storage
+async function getWebhookConfig(env: Env, webhookId: string): Promise<WebhookConfig | null> {
+  if (!env.WEBHOOKS) {
+    return null;
+  }
+  const data = await env.WEBHOOKS.get(`${WEBHOOK_CONFIG_PREFIX}${webhookId}`, 'json');
+  return data as WebhookConfig | null;
+}
+
+async function setWebhookConfig(env: Env, webhookId: string, config: WebhookConfig): Promise<void> {
+  if (!env.WEBHOOKS) return;
+  await env.WEBHOOKS.put(`${WEBHOOK_CONFIG_PREFIX}${webhookId}`, JSON.stringify(config));
+  // Update index
+  const index = await getWebhookIndex(env);
+  if (!index.includes(webhookId)) {
+    index.push(webhookId);
+    await env.WEBHOOKS.put(WEBHOOK_INDEX_KEY, JSON.stringify(index));
+  }
+}
+
+async function deleteWebhookConfig(env: Env, webhookId: string): Promise<void> {
+  if (!env.WEBHOOKS) return;
+  await env.WEBHOOKS.delete(`${WEBHOOK_CONFIG_PREFIX}${webhookId}`);
+  // Update index
+  const index = await getWebhookIndex(env);
+  const newIndex = index.filter(id => id !== webhookId);
+  await env.WEBHOOKS.put(WEBHOOK_INDEX_KEY, JSON.stringify(newIndex));
+}
+
+async function getWebhookIndex(env: Env): Promise<string[]> {
+  if (!env.WEBHOOKS) return [];
+  const data = await env.WEBHOOKS.get(WEBHOOK_INDEX_KEY, 'json');
+  return (data as string[]) || [];
+}
+
+async function getEventIndex(env: Env): Promise<string[]> {
+  if (!env.WEBHOOKS) return [];
+  const data = await env.WEBHOOKS.get(WEBHOOK_EVENT_INDEX_KEY, 'json');
+  return (data as string[]) || [];
+}
+
+async function addEventToIndex(env: Env, eventId: string): Promise<void> {
+  if (!env.WEBHOOKS) return;
+  const index = await getEventIndex(env);
+  if (!index.includes(eventId)) {
+    index.push(eventId);
+    await env.WEBHOOKS.put(WEBHOOK_EVENT_INDEX_KEY, JSON.stringify(index));
+  }
+}
+
+async function getDeliveryIndex(env: Env): Promise<string[]> {
+  if (!env.WEBHOOKS) return [];
+  const data = await env.WEBHOOKS.get(WEBHOOK_DELIVERY_INDEX_KEY, 'json');
+  return (data as string[]) || [];
+}
+
+async function addDeliveryToIndex(env: Env, deliveryId: string): Promise<void> {
+  if (!env.WEBHOOKS) return;
+  const index = await getDeliveryIndex(env);
+  if (!index.includes(deliveryId)) {
+    index.push(deliveryId);
+    await env.WEBHOOKS.put(WEBHOOK_DELIVERY_INDEX_KEY, JSON.stringify(index));
+  }
+}
+
 // Create webhook event
-export async function createWebhookEvent(webhookId: string, eventType: string, batchId: string, payload: any): Promise<string> {
+export async function createWebhookEvent(env: Env, webhookId: string, eventType: string, batchId: string, payload: any): Promise<string> {
   const eventId = generateEventId();
   const event: WebhookEvent = {
     id: eventId,
@@ -46,33 +118,43 @@ export async function createWebhookEvent(webhookId: string, eventType: string, b
     nextRetry: undefined
   };
   
-  webhookEvents.set(eventId, event);
+  if (env.WEBHOOKS) {
+    await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+    await addEventToIndex(env, eventId);
+  }
+  
   return eventId;
 }
 
-// Create webhook signature
+// Create webhook signature using proper HMAC-SHA256
 export async function createWebhookSignature(secret: string, payload: string): Promise<string> {
-  // Simple HMAC-SHA256 signature (in a real implementation, you'd use a proper crypto library)
   const encoder = new TextEncoder();
   const key = encoder.encode(secret);
   const data = encoder.encode(payload);
   
-  // This is a simplified implementation - in production, use a proper HMAC library
-  const combined = new Uint8Array(key.length + data.length);
-  combined.set(key);
-  combined.set(data, key.length);
+  // Import the key for HMAC
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
   
-  const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  // Perform HMAC-SHA256
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, data);
+  const hashArray = Array.from(new Uint8Array(signature));
   const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   
   return `sha256=${hashHex}`;
 }
 
 // Deliver webhook
-export async function deliverWebhook(webhookId: string, eventId: string): Promise<boolean> {
-  const webhook = webhookConfigs.get(webhookId);
-  const event = webhookEvents.get(eventId);
+export async function deliverWebhook(env: Env, webhookId: string, eventId: string): Promise<boolean> {
+  const webhook = await getWebhookConfig(env, webhookId);
+  if (!env.WEBHOOKS) return false;
+  const eventData = await env.WEBHOOKS.get(`${WEBHOOK_EVENT_PREFIX}${eventId}`, 'json');
+  const event = eventData as WebhookEvent | null;
   
   if (!webhook || !event || !webhook.active) {
     return false;
@@ -120,13 +202,19 @@ export async function deliverWebhook(webhookId: string, eventId: string): Promis
       event.status = 'delivered';
       event.attempts++;
       event.lastAttempt = endTime;
-      webhookEvents.set(eventId, event);
-      webhookDeliveries.set(deliveryId, delivery);
+      if (env.WEBHOOKS) {
+        await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+        await env.WEBHOOKS.put(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`, JSON.stringify(delivery));
+        await addDeliveryToIndex(env, deliveryId);
+      }
       return true;
     } else {
       delivery.status = 'failed';
       delivery.error = `HTTP ${response.status}: ${delivery.responseBody}`;
-      webhookDeliveries.set(deliveryId, delivery);
+      if (env.WEBHOOKS) {
+        await env.WEBHOOKS.put(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`, JSON.stringify(delivery));
+        await addDeliveryToIndex(env, deliveryId);
+      }
       
       // Schedule retry if within limits
       if (event.attempts < event.maxAttempts) {
@@ -134,11 +222,15 @@ export async function deliverWebhook(webhookId: string, eventId: string): Promis
         event.attempts++;
         event.nextRetry = Date.now() + WEBHOOK_CONFIG.RETRY_DELAY * Math.pow(2, event.attempts - 1);
         event.lastAttempt = endTime;
-        webhookEvents.set(eventId, event);
+        if (env.WEBHOOKS) {
+          await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+        }
       } else {
         event.status = 'failed';
         event.lastAttempt = endTime;
-        webhookEvents.set(eventId, event);
+        if (env.WEBHOOKS) {
+          await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+        }
       }
       
       return false;
@@ -148,7 +240,10 @@ export async function deliverWebhook(webhookId: string, eventId: string): Promis
     delivery.duration = endTime - startTime;
     delivery.status = 'failed';
     delivery.error = error instanceof Error ? error.message : 'Unknown error';
-    webhookDeliveries.set(deliveryId, delivery);
+    if (env.WEBHOOKS) {
+      await env.WEBHOOKS.put(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`, JSON.stringify(delivery));
+      await addDeliveryToIndex(env, deliveryId);
+    }
     
     // Schedule retry if within limits
     if (event.attempts < event.maxAttempts) {
@@ -156,11 +251,15 @@ export async function deliverWebhook(webhookId: string, eventId: string): Promis
       event.attempts++;
       event.nextRetry = Date.now() + WEBHOOK_CONFIG.RETRY_DELAY * Math.pow(2, event.attempts - 1);
       event.lastAttempt = endTime;
-      webhookEvents.set(eventId, event);
+      if (env.WEBHOOKS) {
+        await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+      }
     } else {
       event.status = 'failed';
       event.lastAttempt = endTime;
-      webhookEvents.set(eventId, event);
+      if (env.WEBHOOKS) {
+        await env.WEBHOOKS.put(`${WEBHOOK_EVENT_PREFIX}${eventId}`, JSON.stringify(event));
+      }
     }
     
     return false;
@@ -168,8 +267,8 @@ export async function deliverWebhook(webhookId: string, eventId: string): Promis
 }
 
 // Process webhook events
-export async function processWebhookEvents(): Promise<void> {
-  if (!WEBHOOK_CONFIG.ENABLED) {
+export async function processWebhookEvents(env: Env): Promise<void> {
+  if (!WEBHOOK_CONFIG.ENABLED || !env.WEBHOOKS) {
     return;
   }
   
@@ -177,17 +276,21 @@ export async function processWebhookEvents(): Promise<void> {
   const eventsToProcess: WebhookEvent[] = [];
   
   // Find events that need processing
-  for (const event of webhookEvents.values()) {
-    if (event.status === 'pending' || 
-        (event.status === 'pending' && event.nextRetry && now >= event.nextRetry)) {
-      eventsToProcess.push(event);
+  const eventIndex = await getEventIndex(env);
+  for (const eventId of eventIndex) {
+    const eventData = await env.WEBHOOKS.get(`${WEBHOOK_EVENT_PREFIX}${eventId}`, 'json');
+    if (eventData) {
+      const event = eventData as WebhookEvent;
+      if (event.status === 'pending' && (!event.nextRetry || now >= event.nextRetry)) {
+        eventsToProcess.push(event);
+      }
     }
   }
   
   // Process events
   for (const event of eventsToProcess) {
     try {
-      await deliverWebhook(event.webhookId, event.id);
+      await deliverWebhook(env, event.webhookId, event.id);
     } catch (error) {
       console.error(`Failed to process webhook event ${event.id}:`, error);
     }
@@ -195,48 +298,78 @@ export async function processWebhookEvents(): Promise<void> {
 }
 
 // Cleanup old webhook data
-export async function cleanupWebhookData(): Promise<void> {
+export async function cleanupWebhookData(env: Env): Promise<void> {
+  if (!env.WEBHOOKS) return;
+  
   const now = Date.now();
   const maxAge = WEBHOOK_CONFIG.MAX_EVENT_AGE;
   
   // Clean up old events
-  for (const [eventId, event] of webhookEvents.entries()) {
-    if (now - event.createdAt > maxAge) {
-      webhookEvents.delete(eventId);
+  const eventIndex = await getEventIndex(env);
+  const eventsToDelete: string[] = [];
+  for (const eventId of eventIndex) {
+    const eventData = await env.WEBHOOKS.get(`${WEBHOOK_EVENT_PREFIX}${eventId}`, 'json');
+    if (eventData) {
+      const event = eventData as WebhookEvent;
+      if (now - event.createdAt > maxAge) {
+        await env.WEBHOOKS.delete(`${WEBHOOK_EVENT_PREFIX}${eventId}`);
+        eventsToDelete.push(eventId);
+      }
     }
   }
+  // Update index
+  const newEventIndex = eventIndex.filter(id => !eventsToDelete.includes(id));
+  await env.WEBHOOKS.put(WEBHOOK_EVENT_INDEX_KEY, JSON.stringify(newEventIndex));
   
   // Clean up old deliveries
-  for (const [deliveryId, delivery] of webhookDeliveries.entries()) {
-    if (now - delivery.attemptedAt > maxAge) {
-      webhookDeliveries.delete(deliveryId);
+  const deliveryIndex = await getDeliveryIndex(env);
+  const deliveriesToDelete: string[] = [];
+  for (const deliveryId of deliveryIndex) {
+    const deliveryData = await env.WEBHOOKS.get(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`, 'json');
+    if (deliveryData) {
+      const delivery = deliveryData as WebhookDelivery;
+      if (now - delivery.attemptedAt > maxAge) {
+        await env.WEBHOOKS.delete(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`);
+        deliveriesToDelete.push(deliveryId);
+      }
     }
   }
+  // Update index
+  const newDeliveryIndex = deliveryIndex.filter(id => !deliveriesToDelete.includes(id));
+  await env.WEBHOOKS.put(WEBHOOK_DELIVERY_INDEX_KEY, JSON.stringify(newDeliveryIndex));
 }
 
 // Initialize webhook processing
-export function initializeWebhookProcessing(): void {
+export function initializeWebhookProcessing(env: Env): void {
+  // Guard: only initialize once
+  if (webhookProcessingInitialized) {
+    return;
+  }
+  
   if (!WEBHOOK_CONFIG.ENABLED) {
     return;
   }
   
+  // Mark as initialized before creating intervals
+  webhookProcessingInitialized = true;
+  
   // Process webhook events every 30 seconds
   setInterval(() => {
-    processWebhookEvents().catch(error => {
+    processWebhookEvents(env).catch(error => {
       console.error("Webhook processing failed:", error);
     });
   }, 30000);
   
   // Cleanup old data every hour
   setInterval(() => {
-    cleanupWebhookData().catch(error => {
+    cleanupWebhookData(env).catch(error => {
       console.error("Webhook cleanup failed:", error);
     });
   }, 60 * 60 * 1000);
 }
 
 // Trigger webhook for batch completion
-export async function triggerBatchCompletionWebhook(batchId: string, batchStatus: any): Promise<void> {
+export async function triggerBatchCompletionWebhook(env: Env, batchId: string, batchStatus: any): Promise<void> {
   if (!WEBHOOK_CONFIG.ENABLED) {
     return;
   }
@@ -252,10 +385,12 @@ export async function triggerBatchCompletionWebhook(batchId: string, batchStatus
   };
   
   // Create events for all enabled webhooks
-  for (const [webhookId, webhook] of webhookConfigs.entries()) {
-    if (webhook.active && webhook.events.includes('batch.completed')) {
+  const webhookIndex = await getWebhookIndex(env);
+  for (const webhookId of webhookIndex) {
+    const webhook = await getWebhookConfig(env, webhookId);
+    if (webhook && webhook.active && webhook.events.includes('batch.completed')) {
       try {
-        await createWebhookEvent(webhookId, 'batch.completed', batchId, payload);
+        await createWebhookEvent(env, webhookId, 'batch.completed', batchId, payload);
       } catch (error) {
         console.error(`Failed to create webhook event for ${webhookId}:`, error);
       }
@@ -264,8 +399,9 @@ export async function triggerBatchCompletionWebhook(batchId: string, batchStatus
 }
 
 // Webhook management functions
-export function createWebhook(config: Omit<WebhookConfig, 'createdAt' | 'lastDelivery' | 'failureCount' | 'maxFailures'>): string {
-  if (webhookConfigs.size >= WEBHOOK_CONFIG.MAX_WEBHOOKS) {
+export async function createWebhook(env: Env, config: Omit<WebhookConfig, 'createdAt' | 'lastDelivery' | 'failureCount' | 'maxFailures'>): Promise<string> {
+  const webhookIndex = await getWebhookIndex(env);
+  if (webhookIndex.length >= WEBHOOK_CONFIG.MAX_WEBHOOKS) {
     throw new Error('Maximum number of webhooks reached');
   }
   
@@ -278,43 +414,74 @@ export function createWebhook(config: Omit<WebhookConfig, 'createdAt' | 'lastDel
     maxFailures: 5
   };
   
-  webhookConfigs.set(webhookId, webhook);
+  await setWebhookConfig(env, webhookId, webhook);
   return webhookId;
 }
 
-export function updateWebhook(webhookId: string, updates: Partial<WebhookConfig>): boolean {
-  const webhook = webhookConfigs.get(webhookId);
+export async function updateWebhook(env: Env, webhookId: string, updates: Partial<WebhookConfig>): Promise<boolean> {
+  const webhook = await getWebhookConfig(env, webhookId);
   if (!webhook) {
     return false;
   }
   
   const updatedWebhook = { ...webhook, ...updates };
-  webhookConfigs.set(webhookId, updatedWebhook);
+  await setWebhookConfig(env, webhookId, updatedWebhook);
   return true;
 }
 
-export function deleteWebhook(webhookId: string): boolean {
-  return webhookConfigs.delete(webhookId);
-}
-
-export function getWebhook(webhookId: string): WebhookConfig | undefined {
-  return webhookConfigs.get(webhookId);
-}
-
-export function getAllWebhooks(): Map<string, WebhookConfig> {
-  return new Map(webhookConfigs);
-}
-
-export function getWebhookEvents(webhookId?: string): WebhookEvent[] {
-  if (webhookId) {
-    return Array.from(webhookEvents.values()).filter(event => event.webhookId === webhookId);
+export async function deleteWebhook(env: Env, webhookId: string): Promise<boolean> {
+  const webhook = await getWebhookConfig(env, webhookId);
+  if (!webhook) {
+    return false;
   }
-  return Array.from(webhookEvents.values());
+  await deleteWebhookConfig(env, webhookId);
+  return true;
 }
 
-export function getWebhookDeliveries(webhookId?: string): WebhookDelivery[] {
-  if (webhookId) {
-    return Array.from(webhookDeliveries.values()).filter(delivery => delivery.webhookId === webhookId);
+export async function getWebhook(env: Env, webhookId: string): Promise<WebhookConfig | null> {
+  return await getWebhookConfig(env, webhookId);
+}
+
+export async function getAllWebhooks(env: Env): Promise<Map<string, WebhookConfig>> {
+  const webhookIndex = await getWebhookIndex(env);
+  const webhooks = new Map<string, WebhookConfig>();
+  for (const webhookId of webhookIndex) {
+    const webhook = await getWebhookConfig(env, webhookId);
+    if (webhook) {
+      webhooks.set(webhookId, webhook);
+    }
   }
-  return Array.from(webhookDeliveries.values());
+  return webhooks;
+}
+
+export async function getWebhookEvents(env: Env, webhookId?: string): Promise<WebhookEvent[]> {
+  if (!env.WEBHOOKS) return [];
+  const eventIndex = await getEventIndex(env);
+  const events: WebhookEvent[] = [];
+  for (const eventId of eventIndex) {
+    const eventData = await env.WEBHOOKS.get(`${WEBHOOK_EVENT_PREFIX}${eventId}`, 'json');
+    if (eventData) {
+      const event = eventData as WebhookEvent;
+      if (!webhookId || event.webhookId === webhookId) {
+        events.push(event);
+      }
+    }
+  }
+  return events;
+}
+
+export async function getWebhookDeliveries(env: Env, webhookId?: string): Promise<WebhookDelivery[]> {
+  if (!env.WEBHOOKS) return [];
+  const deliveryIndex = await getDeliveryIndex(env);
+  const deliveries: WebhookDelivery[] = [];
+  for (const deliveryId of deliveryIndex) {
+    const deliveryData = await env.WEBHOOKS.get(`${WEBHOOK_DELIVERY_PREFIX}${deliveryId}`, 'json');
+    if (deliveryData) {
+      const delivery = deliveryData as WebhookDelivery;
+      if (!webhookId || delivery.webhookId === webhookId) {
+        deliveries.push(delivery);
+      }
+    }
+  }
+  return deliveries;
 }

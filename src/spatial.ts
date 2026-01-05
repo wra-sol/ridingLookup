@@ -2,8 +2,19 @@ import { Env, GeoJSONFeature, GeoJSONFeatureCollection, GeoJSONGeometry, Spatial
 import { isPointInPolygon } from './utils';
 
 // Spatial database configuration
+// ENABLED can be set via environment variable SPATIAL_DB_ENABLED
+export function getSpatialDbConfig(env?: { SPATIAL_DB_ENABLED?: string }): { ENABLED: boolean; USE_RTREE_INDEX: boolean; BATCH_INSERT_SIZE: number } {
+  return {
+    ENABLED: env?.SPATIAL_DB_ENABLED === 'true' || env?.SPATIAL_DB_ENABLED === '1',
+    USE_RTREE_INDEX: true,
+    BATCH_INSERT_SIZE: 100
+  };
+}
+
+// Legacy export for backward compatibility (defaults to disabled)
+// Use getSpatialDbConfig(env) in new code to check if enabled
 export const SPATIAL_DB_CONFIG = {
-  ENABLED: false, // Enable when D1 database is configured
+  ENABLED: false, // Deprecated: Use getSpatialDbConfig(env).ENABLED instead
   USE_RTREE_INDEX: true,
   BATCH_INSERT_SIZE: 100
 };
@@ -27,13 +38,34 @@ export interface SpatialIndex {
   boundingBox: BoundingBox;
 }
 
-// Calculate bounding box for a geometry
+/**
+ * Calculates the bounding box (min/max coordinates) for a GeoJSON geometry.
+ * Handles Polygon and MultiPolygon types, with validation for empty/invalid geometries.
+ * 
+ * @param geometry - GeoJSON geometry (Polygon or MultiPolygon)
+ * @returns Bounding box with minX, minY, maxX, maxY
+ * @throws Error if geometry is missing coordinates or invalid
+ */
 export function calculateBoundingBox(geometry: GeoJSONGeometry): BoundingBox {
+  // Validate geometry has coordinates
+  if (!geometry || !geometry.coordinates) {
+    throw new Error('Geometry missing coordinates');
+  }
+  
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   
   const processCoordinates = (coords: number[][]) => {
+    if (!Array.isArray(coords) || coords.length === 0) {
+      return; // Skip empty coordinate arrays
+    }
     for (const coord of coords) {
+      if (!Array.isArray(coord) || coord.length < 2) {
+        continue; // Skip invalid coordinates
+      }
       const [x, y] = coord;
+      if (typeof x !== 'number' || typeof y !== 'number' || isNaN(x) || isNaN(y)) {
+        continue; // Skip invalid numeric values
+      }
       minX = Math.min(minX, x);
       minY = Math.min(minY, y);
       maxX = Math.max(maxX, x);
@@ -43,22 +75,42 @@ export function calculateBoundingBox(geometry: GeoJSONGeometry): BoundingBox {
   
   if (geometry.type === "Polygon") {
     const coords = geometry.coordinates as number[][][];
+    if (!Array.isArray(coords) || coords.length === 0) {
+      throw new Error('Polygon coordinates must be a non-empty array');
+    }
     for (const ring of coords) {
       processCoordinates(ring);
     }
   } else if (geometry.type === "MultiPolygon") {
     const coords = geometry.coordinates as number[][][][];
+    if (!Array.isArray(coords) || coords.length === 0) {
+      throw new Error('MultiPolygon coordinates must be a non-empty array');
+    }
     for (const polygon of coords) {
+      if (!Array.isArray(polygon)) continue;
       for (const ring of polygon) {
         processCoordinates(ring);
       }
     }
+  } else {
+    throw new Error(`Unsupported geometry type: ${geometry.type}`);
+  }
+  
+  // Check if we found any valid coordinates
+  if (minX === Infinity || minY === Infinity || maxX === -Infinity || maxY === -Infinity) {
+    throw new Error('No valid coordinates found in geometry');
   }
   
   return { minX, minY, maxX, maxY };
 }
 
-// Create spatial index for a FeatureCollection
+/**
+ * Creates a spatial index (R-tree-like structure) for a GeoJSON FeatureCollection.
+ * Pre-computes bounding boxes for all features to enable fast spatial queries.
+ * 
+ * @param featureCollection - GeoJSON FeatureCollection to index
+ * @returns Spatial index with entries and overall bounding box
+ */
 export function createSpatialIndex(featureCollection: GeoJSONFeatureCollection): SpatialIndex {
   const entries: SpatialIndexEntry[] = [];
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -80,13 +132,29 @@ export function createSpatialIndex(featureCollection: GeoJSONFeatureCollection):
   };
 }
 
-// Check if point is within bounding box
+/**
+ * Checks if a geographic point is within a bounding box (inclusive boundaries).
+ * 
+ * @param lon - Longitude
+ * @param lat - Latitude
+ * @param boundingBox - Bounding box with minX, minY, maxX, maxY
+ * @returns true if point is within or on the boundary of the box
+ */
 export function isPointInBoundingBox(lon: number, lat: number, boundingBox: BoundingBox): boolean {
   return lon >= boundingBox.minX && lon <= boundingBox.maxX &&
          lat >= boundingBox.minY && lat <= boundingBox.maxY;
 }
 
-// Find candidate features using spatial index
+/**
+ * Finds candidate features that might contain a point using bounding box pre-filtering.
+ * Returns features whose bounding boxes contain the point; exact point-in-polygon
+ * testing should be performed on the candidates.
+ * 
+ * @param lon - Longitude
+ * @param lat - Latitude
+ * @param spatialIndex - Pre-computed spatial index
+ * @returns Array of candidate features (may need further point-in-polygon testing)
+ */
 export function findCandidateFeatures(lon: number, lat: number, spatialIndex: SpatialIndex): GeoJSONFeature[] {
   const candidates: GeoJSONFeature[] = [];
   
@@ -145,7 +213,8 @@ export function calculateCentroid(geometry: any): { lon: number; lat: number } {
 
 // Initialize spatial database
 export async function initializeSpatialDatabase(env: Env): Promise<boolean> {
-  if (!SPATIAL_DB_CONFIG.ENABLED || !env.RIDING_DB) {
+  const dbConfig = getSpatialDbConfig(env);
+  if (!dbConfig.ENABLED || !env.RIDING_DB) {
     return false;
   }
 
@@ -181,7 +250,7 @@ export async function initializeSpatialDatabase(env: Env): Promise<boolean> {
     `).run();
 
     // Create R-tree virtual table for spatial indexing if enabled
-    if (SPATIAL_DB_CONFIG.USE_RTREE_INDEX) {
+    if (dbConfig.USE_RTREE_INDEX) {
       await env.RIDING_DB.prepare(`
         CREATE VIRTUAL TABLE IF NOT EXISTS spatial_rtree USING rtree(
           id,
@@ -201,7 +270,8 @@ export async function initializeSpatialDatabase(env: Env): Promise<boolean> {
 
 // Insert features into spatial database
 export async function insertFeaturesIntoDatabase(env: Env, dataset: string, features: GeoJSONFeature[]): Promise<boolean> {
-  if (!SPATIAL_DB_CONFIG.ENABLED || !env.RIDING_DB) {
+  const dbConfig = getSpatialDbConfig(env);
+  if (!dbConfig.ENABLED || !env.RIDING_DB) {
     return false;
   }
 
@@ -234,7 +304,7 @@ export async function insertFeaturesIntoDatabase(env: Env, dataset: string, feat
       ));
 
       // Insert into R-tree index if enabled
-      if (SPATIAL_DB_CONFIG.USE_RTREE_INDEX) {
+      if (dbConfig.USE_RTREE_INDEX) {
         statements.push(env.RIDING_DB.prepare(`
           INSERT OR REPLACE INTO spatial_rtree (id, minx, maxx, miny, maxy)
           VALUES (?, ?, ?, ?, ?)
@@ -252,8 +322,19 @@ export async function insertFeaturesIntoDatabase(env: Env, dataset: string, feat
 }
 
 // Query spatial database for point-in-polygon lookup
+/**
+ * Queries the D1 spatial database to find a riding containing a point.
+ * Uses spatial SQL functions (ST_Contains) for efficient point-in-polygon queries.
+ * 
+ * @param env - Environment bindings containing D1 database
+ * @param dataset - Dataset name (e.g., 'federalridings-2024')
+ * @param lon - Longitude
+ * @param lat - Latitude
+ * @returns Matching GeoJSON feature or null if not found
+ */
 export async function queryRidingFromDatabase(env: Env, dataset: string, lon: number, lat: number): Promise<GeoJSONFeature | null> {
-  if (!SPATIAL_DB_CONFIG.ENABLED || !env.RIDING_DB) {
+  const dbConfig = getSpatialDbConfig(env);
+  if (!dbConfig.ENABLED || !env.RIDING_DB) {
     return null;
   }
 
@@ -262,7 +343,7 @@ export async function queryRidingFromDatabase(env: Env, dataset: string, lon: nu
     let query = '';
     let params: any[] = [];
 
-    if (SPATIAL_DB_CONFIG.USE_RTREE_INDEX) {
+    if (dbConfig.USE_RTREE_INDEX) {
       query = `
         SELECT sf.feature_data 
         FROM spatial_features sf
@@ -286,10 +367,22 @@ export async function queryRidingFromDatabase(env: Env, dataset: string, lon: nu
     const results = await env.RIDING_DB.prepare(query).bind(...params).all();
 
     // Perform precise point-in-polygon check on candidates
+    if (!results || !results.results) {
+      return null;
+    }
+    
     for (const result of results.results) {
-      const feature: GeoJSONFeature = JSON.parse(result.feature_data as string);
-      if (isPointInPolygon(lon, lat, feature.geometry)) {
-        return feature;
+      if (!result || !result.feature_data) {
+        continue; // Skip invalid results
+      }
+      try {
+        const feature: GeoJSONFeature = JSON.parse(result.feature_data as string);
+        if (feature && feature.geometry && isPointInPolygon(lon, lat, feature.geometry)) {
+          return feature;
+        }
+      } catch (parseError) {
+        console.warn('Failed to parse feature_data from database:', parseError);
+        continue;
       }
     }
 
@@ -302,7 +395,8 @@ export async function queryRidingFromDatabase(env: Env, dataset: string, lon: nu
 
 // Get all features from database with pagination
 export async function getAllFeaturesFromDatabase(env: Env, dataset: string, limit: number = 100, offset: number = 0): Promise<{ features: GeoJSONFeature[]; total: number }> {
-  if (!SPATIAL_DB_CONFIG.ENABLED || !env.RIDING_DB) {
+  const dbConfig = getSpatialDbConfig(env);
+  if (!dbConfig.ENABLED || !env.RIDING_DB) {
     return { features: [], total: 0 };
   }
 
@@ -312,7 +406,7 @@ export async function getAllFeaturesFromDatabase(env: Env, dataset: string, limi
       SELECT COUNT(*) as total FROM spatial_features WHERE dataset = ?
     `).bind(dataset).first();
 
-    const total = countResult?.total as number || 0;
+    const total = (countResult && typeof countResult.total === 'number') ? countResult.total : 0;
 
     // Get features with pagination
     const results = await env.RIDING_DB.prepare(`
@@ -323,9 +417,25 @@ export async function getAllFeaturesFromDatabase(env: Env, dataset: string, limi
       LIMIT ? OFFSET ?
     `).bind(dataset, limit, offset).all();
 
-    const features: GeoJSONFeature[] = results.results.map(result => 
-      JSON.parse(result.feature_data as string)
-    );
+    if (!results || !results.results) {
+      return { features: [], total };
+    }
+
+    const features: GeoJSONFeature[] = [];
+    for (const result of results.results) {
+      if (!result || !result.feature_data) {
+        continue; // Skip invalid results
+      }
+      try {
+        const feature = JSON.parse(result.feature_data as string) as GeoJSONFeature;
+        if (feature && feature.type === 'Feature') {
+          features.push(feature);
+        }
+      } catch (parseError) {
+        console.warn('Failed to parse feature_data from database:', parseError);
+        continue;
+      }
+    }
 
     return { features, total };
   } catch (error) {
@@ -340,7 +450,8 @@ export async function syncGeoJSONToDatabase(
   dataset: string,
   loadGeo: (env: Env, r2Key: string) => Promise<GeoJSONFeatureCollection>
 ): Promise<boolean> {
-  if (!SPATIAL_DB_CONFIG.ENABLED || !env.RIDING_DB) {
+  const dbConfig = getSpatialDbConfig(env);
+  if (!dbConfig.ENABLED || !env.RIDING_DB) {
     return false;
   }
 
@@ -356,7 +467,7 @@ export async function syncGeoJSONToDatabase(
     // Clear existing data for this dataset
     await env.RIDING_DB.prepare(`DELETE FROM spatial_features WHERE dataset = ?`).bind(dataset).run();
     
-    if (SPATIAL_DB_CONFIG.USE_RTREE_INDEX) {
+    if (dbConfig.USE_RTREE_INDEX) {
       // Clear R-tree entries for this dataset
       const existingIds = await env.RIDING_DB.prepare(`
         SELECT id FROM spatial_features WHERE dataset = ?
@@ -368,7 +479,7 @@ export async function syncGeoJSONToDatabase(
     }
     
     // Insert features in batches
-    const batchSize = SPATIAL_DB_CONFIG.BATCH_INSERT_SIZE;
+    const batchSize = dbConfig.BATCH_INSERT_SIZE;
     for (let i = 0; i < featureCollection.features.length; i += batchSize) {
       const batch = featureCollection.features.slice(i, i + batchSize);
       await insertFeaturesIntoDatabase(env, dataset, batch);

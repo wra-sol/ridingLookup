@@ -1,4 +1,12 @@
 import { Metrics } from './types';
+import { TIME_CONSTANTS } from './config';
+
+// Metrics window configuration (24 hours)
+const METRICS_WINDOW_MS = TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS;
+const METRICS_RESET_INTERVAL_MS = TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS;
+
+// Track when metrics were last reset
+let lastResetTime = Date.now();
 
 // Global metrics object
 const metrics: Metrics = {
@@ -36,12 +44,23 @@ const metrics: Metrics = {
   totalWebhookTime: 0
 };
 
+// Auto-reset metrics if window has passed
+function checkAndResetMetrics(): void {
+  const now = Date.now();
+  if (now - lastResetTime >= METRICS_RESET_INTERVAL_MS) {
+    resetMetrics();
+    lastResetTime = now;
+  }
+}
+
 // Metrics helper functions
 export function incrementMetric(key: keyof Metrics, value: number = 1): void {
+  checkAndResetMetrics();
   metrics[key] += value;
 }
 
 export function recordTiming(key: keyof Metrics, duration: number): void {
+  checkAndResetMetrics();
   metrics[key] += duration;
 }
 
@@ -53,6 +72,12 @@ export function resetMetrics(): void {
   Object.keys(metrics).forEach(key => {
     metrics[key as keyof Metrics] = 0;
   });
+  lastResetTime = Date.now();
+}
+
+// Get time since last reset (for metrics window calculation)
+export function getMetricsAge(): number {
+  return Date.now() - lastResetTime;
 }
 
 // Get metrics summary for monitoring

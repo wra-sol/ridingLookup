@@ -5,6 +5,10 @@ import { incrementMetric, recordTiming } from './metrics';
 // Default batch size
 const DEFAULT_BATCH_SIZE = 10;
 
+// Maximum batch size limits
+export const MAX_BATCH_SIZE = 100;
+export const MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+
 // Process batch lookup with individual geocoding
 export async function processBatchLookup(
   env: Env, 
@@ -12,8 +16,15 @@ export async function processBatchLookup(
   geocodeIfNeeded: (env: Env, query: any, request?: Request) => Promise<{ lon: number; lat: number }>,
   lookupRiding: (env: Env, pathname: string, lon: number, lat: number) => Promise<any>
 ): Promise<BatchLookupResponse[]> {
+  // Validate batch size
+  if (requests.length > MAX_BATCH_SIZE) {
+    throw new Error(`Batch size exceeds maximum of ${MAX_BATCH_SIZE} requests`);
+  }
+  
   const results: BatchLookupResponse[] = [];
-  const batchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
+  // Validate and clamp batch size from environment
+  const rawBatchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
+  const batchSize = Math.max(1, Math.min(Math.floor(rawBatchSize), MAX_BATCH_SIZE));
   
   incrementMetric('batchRequests');
   const startTime = Date.now();
@@ -69,8 +80,15 @@ export async function processBatchLookupWithBatchGeocoding(
   lookupRiding: (env: Env, pathname: string, lon: number, lat: number) => Promise<any>,
   geocodeBatchFn: (env: Env, queries: any[], request?: Request) => Promise<Array<{ lon: number; lat: number; success: boolean; error?: string }>>
 ): Promise<BatchLookupResponse[]> {
+  // Validate batch size
+  if (requests.length > MAX_BATCH_SIZE) {
+    throw new Error(`Batch size exceeds maximum of ${MAX_BATCH_SIZE} requests`);
+  }
+  
   const results: BatchLookupResponse[] = [];
-  const batchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
+  // Validate and clamp batch size from environment
+  const rawBatchSize = env.BATCH_SIZE || DEFAULT_BATCH_SIZE;
+  const batchSize = Math.max(1, Math.min(Math.floor(rawBatchSize), MAX_BATCH_SIZE));
   
   incrementMetric('batchRequests');
   const startTime = Date.now();
@@ -179,6 +197,11 @@ export async function processBatchLookupWithBatchGeocoding(
 
 // Queue-based batch processing using Durable Objects
 export async function submitBatchToQueue(env: Env, requests: BatchLookupRequest[]): Promise<{ batchId: string; status: string }> {
+  // Validate batch size
+  if (requests.length > MAX_BATCH_SIZE) {
+    throw new Error(`Batch size exceeds maximum of ${MAX_BATCH_SIZE} requests`);
+  }
+  
   if (!env.QUEUE_MANAGER) {
     throw new Error("Queue manager not configured");
   }

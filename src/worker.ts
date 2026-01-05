@@ -13,10 +13,10 @@ import {
   setCachedSpatialIndex,
   getCachedSimplifiedBoundary,
   setCachedSimplifiedBoundary,
-  initializeCacheWarming,
+  performCacheWarming,
   getCacheWarmingStatus
 } from './cache';
-import { geocodingCircuitBreaker, r2CircuitBreaker } from './circuit-breaker';
+import { initializeCircuitBreakers, geocodingCircuitBreaker, r2CircuitBreaker } from './circuit-breaker';
 import { incrementMetric, recordTiming, getMetrics, getMetricsSummary } from './metrics';
 import { 
   isPointInPolygon, 
@@ -30,7 +30,8 @@ import {
   rateLimitExceededResponse,
   checkRateLimit,
   getClientId,
-  simplifyGeometry
+  simplifyGeometry,
+  getCorrelationId
 } from './utils';
 import { 
   createSpatialIndex, 
@@ -41,7 +42,7 @@ import {
   insertFeaturesIntoDatabase,
   getAllFeaturesFromDatabase,
   syncGeoJSONToDatabase,
-  SPATIAL_DB_CONFIG
+  getSpatialDbConfig
 } from './spatial';
 import { 
   initializeWebhookProcessing, 
@@ -64,36 +65,41 @@ import {
   BATCH_CONFIG
 } from './batch';
 import { QueueManagerDO } from './queue-manager';
+import { CircuitBreakerDO } from './circuit-breaker-do';
 import { createLandingPage, createSwaggerUI, createOpenAPISpec } from './docs';
-
-// Configuration constants
-const DEFAULT_TIMEOUTS = {
-  geocoding: 10000,
-  lookup: 5000,
-  batch: 30000,
-  total: 60000
-};
-
-const DEFAULT_RETRY_CONFIG = {
-  maxAttempts: 3,
-  baseDelay: 1000,
-  maxDelay: 5000,
-  backoffMultiplier: 2,
-  jitter: true
-};
+import { getTimeoutConfig, getRetryConfig, TIME_CONSTANTS } from './config';
 
 // Global state
 let cacheWarmingInitialized = false;
 
+/**
+ * Handle scheduled events (Cron Triggers) for cache warming.
+ */
+async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  console.log(`[Cron] Scheduled event triggered: ${event.cron}`);
+  
+  // Perform cache warming
+  try {
+    await performCacheWarming(env, async (env: Env, r2Key: string) => {
+      await loadGeo(env, r2Key);
+    }, lookupRiding);
+    console.log('[Cron] Cache warming completed successfully');
+  } catch (error) {
+    console.error('[Cron] Cache warming failed:', error);
+  }
+}
+
 // Main lookup function
 async function lookupRiding(env: Env, pathname: string, lon: number, lat: number): Promise<LookupResult> {
-  const timeoutMs = env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup;
+  const timeoutConfig = getTimeoutConfig(env);
+  const timeoutMs = timeoutConfig.lookup;
   
   const lookupPromise = (async () => {
     const { r2Key } = pickDataset(pathname);
     
     // Try spatial database first if enabled
-    if (SPATIAL_DB_CONFIG.ENABLED && env.RIDING_DB) {
+    const dbConfig = getSpatialDbConfig(env);
+    if (dbConfig.ENABLED && env.RIDING_DB) {
       try {
         const dbResult = await queryRidingFromDatabase(env, r2Key, lon, lat);
         if (dbResult) {
@@ -157,12 +163,43 @@ async function loadGeo(env: Env, key: string): Promise<GeoJSONFeatureCollection>
   
   try {
     const geo = await r2CircuitBreaker.execute(`r2:${key}`, async () => {
+      const retryConfig = getRetryConfig();
       return await withRetry(async () => {
         const obj = await env.RIDINGS.get(key);
         if (!obj) throw new Error(`R2 object not found: ${key}`);
         const text = await obj.text();
-        return JSON.parse(text) as GeoJSONFeatureCollection;
-      }, DEFAULT_RETRY_CONFIG, `R2 fetch ${key}`);
+        const parsed = JSON.parse(text) as GeoJSONFeatureCollection;
+        
+        // Validate GeoJSON structure
+        if (!parsed || typeof parsed !== 'object') {
+          throw new Error(`Invalid GeoJSON: not an object`);
+        }
+        if (parsed.type !== 'FeatureCollection') {
+          throw new Error(`Invalid GeoJSON: expected FeatureCollection, got ${parsed.type}`);
+        }
+        if (!Array.isArray(parsed.features)) {
+          throw new Error(`Invalid GeoJSON: features must be an array`);
+        }
+        
+        // Validate features structure
+        for (let i = 0; i < Math.min(parsed.features.length, 10); i++) {
+          const feature = parsed.features[i];
+          if (!feature || typeof feature !== 'object') {
+            throw new Error(`Invalid GeoJSON: feature ${i} is not an object`);
+          }
+          if (feature.type !== 'Feature') {
+            throw new Error(`Invalid GeoJSON: feature ${i} type is not 'Feature'`);
+          }
+          if (!feature.geometry || typeof feature.geometry !== 'object') {
+            throw new Error(`Invalid GeoJSON: feature ${i} missing or invalid geometry`);
+          }
+          if (!feature.geometry.coordinates || !Array.isArray(feature.geometry.coordinates)) {
+            throw new Error(`Invalid GeoJSON: feature ${i} missing or invalid coordinates`);
+          }
+        }
+        
+        return parsed;
+      }, retryConfig, `R2 fetch ${key}`);
     });
     
     // Cache the result
@@ -230,39 +267,65 @@ function featurePropertiesIfContains(ridingFeature: any, lon: number, lat: numbe
   return null;
 }
 
-// Main worker export
+/**
+ * Main Cloudflare Worker entry point.
+ * Handles all incoming HTTP requests and routes them to appropriate handlers.
+ * 
+ * @param request - The incoming HTTP request
+ * @param env - Cloudflare Worker environment bindings (R2, KV, D1, Durable Objects, etc.)
+ * @returns HTTP response with lookup results, error messages, or API documentation
+ * 
+ * Supported endpoints:
+ * - GET /api, /api/qc, /api/on - Riding lookup endpoints
+ * - GET /api/batch - Batch lookup processing
+ * - POST /api/batch/queue - Submit batch to queue
+ * - GET /api/batch/status - Get batch status
+ * - POST /api/batch/process - Process queue jobs
+ * - POST /api/database/* - Spatial database management
+ * - GET /api/boundaries - Get riding boundaries
+ * - GET /webhooks - Webhook management
+ * - GET /, /docs, /swagger - API documentation
+ */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const startTime = Date.now();
+    const correlationId = getCorrelationId(request);
     incrementMetric('requestCount');
     
-    // Initialize cache warming on first request
-    if (!cacheWarmingInitialized) {
-      cacheWarmingInitialized = true;
-      initializeCacheWarming(env, async (env: Env, r2Key: string) => {
-        await loadGeo(env, r2Key);
-      }, lookupRiding).catch(error => {
-        console.error("Failed to initialize cache warming:", error);
-      });
+    // Initialize circuit breakers with environment (for Durable Object support)
+    if (!geocodingCircuitBreaker || !r2CircuitBreaker) {
+      initializeCircuitBreakers(env);
     }
     
+    // Note: Cache warming is now handled by Cloudflare Cron Triggers
+    // See wrangler.toml for cron configuration
+    
     // Initialize webhook processing
-    initializeWebhookProcessing();
+    initializeWebhookProcessing(env);
     
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
       
+      // CORS configuration - can be customized per endpoint
+      const getCorsHeaders = (origin?: string | null): Record<string, string> => {
+        // Allow all origins by default, but can be restricted per endpoint
+        const allowedOrigin = origin || '*';
+        return {
+          'Access-Control-Allow-Origin': allowedOrigin,
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Google-API-Key, X-Correlation-ID, X-Request-ID',
+          'Access-Control-Max-Age': '86400',
+          'X-Correlation-ID': correlationId
+        };
+      };
+      
       // Handle CORS preflight
       if (request.method === 'OPTIONS') {
+        const origin = request.headers.get('Origin');
         return new Response(null, {
           status: 200,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Google-API-Key',
-            'Access-Control-Max-Age': '86400'
-          }
+          headers: getCorsHeaders(origin)
         });
       }
       
@@ -304,8 +367,8 @@ export default {
       if (pathname === '/health') {
         const metrics = getMetrics();
         const circuitBreakerStates = {
-          geocoding: geocodingCircuitBreaker.getStateInfo('geocoding:nominatim'),
-          r2: r2CircuitBreaker.getStateInfo('r2:federalridings-2024.geojson')
+          geocoding: await geocodingCircuitBreaker.getStateInfo('geocoding:nominatim'),
+          r2: await r2CircuitBreaker.getStateInfo('r2:federalridings-2024.geojson')
         };
         
         return new Response(JSON.stringify({
@@ -336,11 +399,12 @@ export default {
       // Webhook management endpoints
       if (pathname.startsWith('/webhooks')) {
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         if (pathname === '/webhooks' && request.method === 'GET') {
-          const webhooks = Array.from(getAllWebhooks().entries()).map(([id, config]) => ({
+          const webhooksMap = await getAllWebhooks(env);
+          const webhooks = Array.from(webhooksMap.entries()).map(([id, config]) => ({
             id,
             url: config.url,
             events: config.events,
@@ -359,7 +423,7 @@ export default {
         }
         
         if (pathname === '/webhooks/events' && request.method === 'GET') {
-          const events = getWebhookEvents();
+          const events = await getWebhookEvents(env);
           return new Response(JSON.stringify({ events }), {
             headers: { 
               "content-type": "application/json; charset=UTF-8",
@@ -369,7 +433,7 @@ export default {
         }
         
         if (pathname === '/webhooks/deliveries' && request.method === 'GET') {
-          const deliveries = getWebhookDeliveries();
+          const deliveries = await getWebhookDeliveries(env);
           return new Response(JSON.stringify({ deliveries }), {
             headers: { 
               "content-type": "application/json; charset=UTF-8",
@@ -386,7 +450,7 @@ export default {
           ...status,
           config: {
             enabled: true,
-            interval: 6 * 60 * 60 * 1000, // 6 hours
+            interval: TIME_CONSTANTS.SIX_HOURS_MS,
             batchSize: 5
           }
         }), {
@@ -401,7 +465,7 @@ export default {
       if (pathname.startsWith('/api/database')) {
         if (pathname === '/api/database/init' && request.method === 'POST') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           try {
@@ -425,7 +489,7 @@ export default {
         
         if (pathname === '/api/database/sync' && request.method === 'POST') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           try {
@@ -453,16 +517,17 @@ export default {
         
         if (pathname === '/api/database/stats' && request.method === 'GET') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           try {
             // This would need to be implemented to get actual database stats
+            const dbConfig = getSpatialDbConfig(env);
             return new Response(JSON.stringify({
-              enabled: SPATIAL_DB_CONFIG.ENABLED,
+              enabled: dbConfig.ENABLED,
               features: 0, // Would need actual count
               lastSync: null, // Would need actual timestamp
-              status: SPATIAL_DB_CONFIG.ENABLED ? "active" : "disabled"
+              status: dbConfig.ENABLED ? "active" : "disabled"
             }), {
               headers: { 
                 "content-type": "application/json; charset=UTF-8",
@@ -538,7 +603,8 @@ export default {
           const offset = parseInt(url.searchParams.get('offset') || '0');
           
           try {
-            if (SPATIAL_DB_CONFIG.ENABLED && env.RIDING_DB) {
+            const dbConfig = getSpatialDbConfig(env);
+            if (dbConfig.ENABLED && env.RIDING_DB) {
               const result = await getAllFeaturesFromDatabase(env, dataset, limit, offset);
               return new Response(JSON.stringify(result), {
                 headers: { 
@@ -558,10 +624,11 @@ export default {
         }
         
         if (pathname === '/api/boundaries/config' && request.method === 'GET') {
+          const dbConfig = getSpatialDbConfig(env);
           return new Response(JSON.stringify({
-            enabled: SPATIAL_DB_CONFIG.ENABLED,
-            useRtreeIndex: SPATIAL_DB_CONFIG.USE_RTREE_INDEX,
-            batchInsertSize: SPATIAL_DB_CONFIG.BATCH_INSERT_SIZE,
+            enabled: dbConfig.ENABLED,
+            useRtreeIndex: dbConfig.USE_RTREE_INDEX,
+            batchInsertSize: dbConfig.BATCH_INSERT_SIZE,
             datasets: ['federalridings-2024.geojson', 'quebecridings-2025.geojson', 'ontarioridings-2022.geojson']
           }), {
             headers: { 
@@ -600,7 +667,7 @@ export default {
       if (pathname === "/api/cache/warm") {
         if (request.method === "POST") {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           try {
@@ -640,10 +707,11 @@ export default {
       if (pathname.startsWith('/api/webhooks')) {
         if (pathname === '/api/webhooks' && request.method === 'GET') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
-          const webhooks = Array.from(getAllWebhooks().entries()).map(([id, config]) => ({
+          const webhooksMap = await getAllWebhooks(env);
+          const webhooks = Array.from(webhooksMap.entries()).map(([id, config]) => ({
             id,
             url: config.url,
             events: config.events,
@@ -665,12 +733,12 @@ export default {
         
         if (pathname === '/api/webhooks' && request.method === 'POST') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           try {
             const body = await request.json() as { url: string; events: string[]; secret?: string };
-            const webhookId = createWebhook({
+            const webhookId = await createWebhook(env, {
               url: body.url,
               events: body.events,
               secret: body.secret || '',
@@ -696,14 +764,14 @@ export default {
         
         if (pathname === '/api/webhooks/events' && request.method === 'GET') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           const url = new URL(request.url);
           const status = url.searchParams.get('status');
           const webhookId = url.searchParams.get('webhookId');
           
-          const events = getWebhookEvents(webhookId || undefined);
+          const events = await getWebhookEvents(env, webhookId || undefined);
           const filteredEvents = status ? events.filter(e => e.status === status) : events;
           
           return new Response(JSON.stringify({ events: filteredEvents }), {
@@ -716,14 +784,14 @@ export default {
         
         if (pathname === '/api/webhooks/deliveries' && request.method === 'GET') {
           if (!checkBasicAuth(request, env)) {
-            return unauthorizedResponse();
+            return unauthorizedResponse(correlationId);
           }
           
           const url = new URL(request.url);
           const webhookId = url.searchParams.get('webhookId');
           const status = url.searchParams.get('status');
           
-          const deliveries = getWebhookDeliveries(webhookId || undefined);
+          const deliveries = await getWebhookDeliveries(env, webhookId || undefined);
           const filteredDeliveries = status ? deliveries.filter(d => d.status === status) : deliveries;
           
           return new Response(JSON.stringify({ deliveries: filteredDeliveries }), {
@@ -740,11 +808,17 @@ export default {
       // Batch processing endpoints
       if (pathname.startsWith('/batch')) {
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         if (pathname === '/batch' && request.method === 'POST') {
           try {
+            // Check request body size (limit to 10MB)
+            const contentLength = request.headers.get('content-length');
+            if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
+              return badRequest('Request body too large. Maximum size is 10MB', 413);
+            }
+            
             const body = await request.json() as { requests: any[] };
             const requests = body.requests.map((req, index) => ({
               id: req.id || `req_${index}`,
@@ -801,10 +875,16 @@ export default {
         
         // Check basic authentication
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         try {
+          // Check request body size (limit to 10MB)
+          const contentLength = request.headers.get('content-length');
+          if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
+            return badRequest('Request body too large. Maximum size is 10MB', 413);
+          }
+          
           const body = await request.json() as { requests: any[] };
           
           if (!body.requests || !Array.isArray(body.requests)) {
@@ -834,7 +914,7 @@ export default {
         
         // Check basic authentication
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         const batchId = url.searchParams.get('batchId');
@@ -866,7 +946,7 @@ export default {
         
         // Check basic authentication
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         try {
@@ -894,7 +974,7 @@ export default {
         
         // Check basic authentication
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         try {
@@ -930,7 +1010,7 @@ export default {
       // Queue processing endpoint (legacy)
       if (pathname === '/queue/process' && request.method === 'POST') {
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         try {
@@ -955,12 +1035,12 @@ export default {
         // Check rate limiting
         const clientId = getClientId(request);
         if (!checkRateLimit(env, clientId)) {
-          return rateLimitExceededResponse();
+          return rateLimitExceededResponse(correlationId);
         }
         
         // Check basic authentication for API routes
         if (!checkBasicAuth(request, env)) {
-          return unauthorizedResponse();
+          return unauthorizedResponse(correlationId);
         }
         
         try {
@@ -968,47 +1048,65 @@ export default {
           
           // Check validation result
           if (!validation.valid) {
-            return badRequest(validation.error || "Invalid query parameters", 400);
+            return badRequest(validation.error || "Invalid query parameters", 400, "INVALID_QUERY", correlationId);
           }
           
           // Use sanitized query parameters
           const sanitizedQuery = validation.sanitized!;
           
+          const timeoutConfig = getTimeoutConfig(env);
           const { lon, lat } = await withTimeout(
             geocodeIfNeeded(env, sanitizedQuery, request),
-            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.geocoding,
+            timeoutConfig.geocoding,
             "Geocoding"
           );
           const result = await withTimeout(
             lookupRiding(env, pathname, lon, lat),
-            env.BATCH_TIMEOUT || DEFAULT_TIMEOUTS.lookup,
+            timeoutConfig.lookup,
             "Riding lookup"
           );
           
           recordTiming('totalLookupTime', Date.now() - startTime);
-          return new Response(JSON.stringify({ query: sanitizedQuery, point: { lon, lat }, ...result }), {
+          const origin = request.headers.get('Origin');
+          return new Response(JSON.stringify({ query: sanitizedQuery, point: { lon, lat }, ...result, correlationId }), {
             headers: { 
               "content-type": "application/json; charset=UTF-8",
-              'Access-Control-Allow-Origin': '*'
+              ...getCorsHeaders(origin)
             }
           });
         } catch (error) {
           incrementMetric('errorCount');
+          console.error(`[${correlationId}] Lookup error:`, error);
           return badRequest(
             error instanceof Error ? error.message : "Lookup failed",
-            500
+            500,
+            "LOOKUP_ERROR",
+            correlationId
           );
         }
       }
       
-      return badRequest("Not found", 404)
+      return badRequest("Not found", 404, "NOT_FOUND", correlationId)
     } catch (err: unknown) {
       incrementMetric('errorCount');
       recordTiming('totalLookupTime', Date.now() - startTime);
-      return badRequest(err instanceof Error ? err.message : "Unexpected error", 400);
+      console.error(`[${correlationId}] Unexpected error:`, err);
+      return badRequest(err instanceof Error ? err.message : "Unexpected error", 400, "UNEXPECTED_ERROR", correlationId);
     }
+  },
+  
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Initialize circuit breakers with environment (for Durable Object support)
+    // This is needed because scheduled events can fire before any HTTP request
+    if (!geocodingCircuitBreaker || !r2CircuitBreaker) {
+      initializeCircuitBreakers(env);
+    }
+    
+    await handleScheduled(event, env, ctx);
   }
 };
 
-// Export Durable Object
+// Export Durable Objects
 export { QueueManagerDO };
+export { CircuitBreakerDO };
+

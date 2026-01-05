@@ -70,9 +70,10 @@ The Riding Lookup API is a Cloudflare Worker that provides geospatial lookup ser
 
 6. **Configure environment variables**
    ```bash
-   # Optional: Set up geocoding providers
-   wrangler secret put MAPBOX_TOKEN  # For Mapbox geocoding
-   wrangler secret put GOOGLE_MAPS_KEY  # For Google Maps geocoding
+   # Optional: Set up fallback geocoding providers
+   # Note: GeoGratis is always used first (no configuration needed)
+   wrangler secret put MAPBOX_TOKEN  # For Mapbox geocoding (fallback)
+   wrangler secret put GOOGLE_MAPS_KEY  # For Google Maps geocoding (fallback)
    ```
 
 7. **Start development server**
@@ -84,10 +85,12 @@ The Riding Lookup API is a Cloudflare Worker that provides geospatial lookup ser
 
 The project uses several configuration options in `wrangler.toml`:
 
-- **Geocoding providers**: `nominatim` (default), `mapbox`, `google`
+- **Geocoding providers**: GeoGratis (primary, always used first), with fallback to `nominatim` (default), `mapbox`, or `google`
 - **Batch processing**: Configurable batch size and timeouts
 - **Rate limiting**: Per-client rate limits
 - **Observability**: Metrics and monitoring settings
+
+**Note**: The service always attempts GeoGratis first. If GeoGratis fails, returns `INTERPOLATED_POSITION`, or has a score below 0.5, it falls back to the configured provider (`GEOCODER` environment variable).
 
 ## Project Architecture
 

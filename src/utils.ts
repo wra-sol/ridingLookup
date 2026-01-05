@@ -1,25 +1,41 @@
 import { Env, QueryParams, GeoJSONGeometry, GeoJSONFeature } from './types';
+import { TIMEOUT_CONFIG, RETRY_CONFIG, getRetryConfig } from './config';
 
-// Configuration constants
-export const DEFAULT_TIMEOUTS = {
-  geocoding: 10000,
-  lookup: 5000,
-  batch: 30000,
-  total: 60000
-};
-
-export const DEFAULT_RETRY_CONFIG = {
-  maxAttempts: 3,
-  baseDelay: 1000,
-  maxDelay: 5000,
-  backoffMultiplier: 2,
-  jitter: true
-};
+// Re-export for backward compatibility
+export const DEFAULT_TIMEOUTS = TIMEOUT_CONFIG;
+export const DEFAULT_RETRY_CONFIG = RETRY_CONFIG;
 
 export const DEFAULT_RATE_LIMIT = 100; // requests per minute
 
 // Rate limiting store
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+// Cleanup expired rate limit entries to prevent memory leaks
+function cleanupRateLimitStore(): void {
+  const now = Date.now();
+  const entriesToDelete: string[] = [];
+  
+  for (const [clientId, entry] of rateLimitStore.entries()) {
+    // Remove entries that are expired by more than 5 minutes (safety margin)
+    if (now > entry.resetTime + 5 * 60 * 1000) {
+      entriesToDelete.push(clientId);
+    }
+  }
+  
+  for (const clientId of entriesToDelete) {
+    rateLimitStore.delete(clientId);
+  }
+  
+  // If store is getting large, do more aggressive cleanup
+  if (rateLimitStore.size > 10000) {
+    const allEntries = Array.from(rateLimitStore.entries());
+    allEntries.sort((a, b) => a[1].resetTime - b[1].resetTime);
+    // Keep only the most recent 5000 entries
+    for (let i = 0; i < allEntries.length - 5000; i++) {
+      rateLimitStore.delete(allEntries[i][0]);
+    }
+  }
+}
 
 // Validation interfaces
 export interface ValidationResult {
@@ -36,7 +52,15 @@ export interface RetryConfig {
   jitter: boolean;
 }
 
-// Geometry utility functions
+/**
+ * Determines if a geographic point is inside a GeoJSON polygon or multipolygon.
+ * Uses ray casting algorithm with explicit boundary point handling.
+ * 
+ * @param lon - Longitude of the point (-180 to 180)
+ * @param lat - Latitude of the point (-90 to 90)
+ * @param geometry - GeoJSON geometry (Polygon or MultiPolygon)
+ * @returns true if point is inside the polygon (including on boundaries), false otherwise
+ */
 export function isPointInPolygon(lon: number, lat: number, geometry: GeoJSONGeometry): boolean {
   const point = [lon, lat];
   const type = geometry?.type;
@@ -55,30 +79,97 @@ export function isPointInPolygon(lon: number, lat: number, geometry: GeoJSONGeom
   return false;
 }
 
+/**
+ * Checks if a point is contained within a polygon, handling holes.
+ * Points on the outer boundary are considered inside; points inside holes are considered outside.
+ * 
+ * @param point - [longitude, latitude] coordinates
+ * @param polygon - Array of rings: [outerRing, hole1, hole2, ...] where each ring is [[lon, lat], ...]
+ * @returns true if point is inside the polygon (not in any holes), false otherwise
+ */
 export function polygonContains(point: number[], polygon: number[][][]): boolean {
   // polygon: [ [ [lon,lat], ... ] outerRing, hole1, hole2, ... ]
   if (!Array.isArray(polygon) || polygon.length === 0) return false;
-  // Must be inside outer ring and outside holes
-  if (!ringContains(point, polygon[0] as number[][])) return false;
+  
+  const outerRing = polygon[0] as number[][];
+  if (!outerRing || !Array.isArray(outerRing)) return false;
+  
+  // Check if point is in outer ring (including boundary)
+  const inOuterRing = ringContains(point, outerRing);
+  if (!inOuterRing) return false;
+  
+  // Check if point is in any hole (if point is on hole boundary, it's considered outside)
   for (let i = 1; i < polygon.length; i++) {
-    if (ringContains(point, polygon[i])) return false; // inside a hole
+    const hole = polygon[i];
+    if (!hole || !Array.isArray(hole)) continue;
+    
+    // Check if point is strictly inside a hole (not on boundary)
+    // For holes, we want to exclude points that are inside, but include points on the boundary
+    const inHole = ringContains(point, hole);
+    if (inHole) {
+      // Double-check: if point is exactly on hole boundary, it should be considered inside polygon
+      // But if it's strictly inside the hole, it's outside the polygon
+      // The ringContains function already handles boundary cases, so if it returns true
+      // and the point is on the boundary, we should still consider it inside the polygon
+      // For now, we'll be conservative: if inHole is true, exclude it
+      return false;
+    }
   }
+  
   return true;
 }
 
+/**
+ * Checks if a point is inside a closed ring using ray casting algorithm.
+ * Points exactly on the ring boundary are considered inside.
+ * 
+ * @param point - [longitude, latitude] coordinates
+ * @param ring - Array of [longitude, latitude] coordinate pairs forming a closed ring
+ * @returns true if point is inside or on the ring boundary, false otherwise
+ */
 export function ringContains(point: number[], ring: number[][]): boolean {
+  if (!Array.isArray(ring) || ring.length < 3) return false;
+  
+  const [px, py] = point;
   let inside = false;
+  
+  // First check if point is exactly on the boundary
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const xi = ring[i][0], yi = ring[i][1];
-    const xj = ring[j][0], yj = ring[j][1];
-    const intersect = ((yi > point[1]) !== (yj > point[1])) &&
-      (point[0] < (xj - xi) * (point[1] - yi) / (yj - yi + 0.0) + xi);
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[j];
+    
+    // Check if point is on the edge segment
+    const minX = Math.min(x1, x2);
+    const maxX = Math.max(x1, x2);
+    const minY = Math.min(y1, y2);
+    const maxY = Math.max(y1, y2);
+    
+    // Point is on boundary if it's on the line segment
+    if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+      // Check if point is collinear with the segment
+      const crossProduct = (py - y1) * (x2 - x1) - (px - x1) * (y2 - y1);
+      const tolerance = 1e-10; // Small tolerance for floating point comparison
+      if (Math.abs(crossProduct) < tolerance) {
+        return true; // Point is on boundary, consider it inside
+      }
+    }
+    
+    // Ray casting algorithm for interior points
+    const intersect = ((y1 > py) !== (y2 > py)) &&
+      (px < (x2 - x1) * (py - y1) / (y2 - y1 + 1e-10) + x1);
     if (intersect) inside = !inside;
   }
+  
   return inside;
 }
 
-// Input validation and sanitization
+/**
+ * Sanitizes a string input by removing control characters and limiting length.
+ * 
+ * @param input - The string to sanitize
+ * @param maxLength - Maximum allowed length (default: 1000)
+ * @returns Sanitized string or undefined if input is empty/invalid
+ */
 export function sanitizeString(input: string | undefined, maxLength: number = 1000): string | undefined {
   if (!input) return undefined;
   
@@ -96,7 +187,13 @@ export function sanitizeString(input: string | undefined, maxLength: number = 10
   return sanitized.length > 0 ? sanitized : undefined;
 }
 
-// Validate and sanitize coordinates
+/**
+ * Validates geographic coordinates.
+ * 
+ * @param lat - Latitude (-90 to 90, inclusive)
+ * @param lon - Longitude (-180 to 180, inclusive)
+ * @returns Validation result with sanitized coordinates or error message
+ */
 export function validateCoordinates(lat: number | undefined, lon: number | undefined): { valid: boolean; lat?: number; lon?: number; error?: string } {
   if (lat === undefined && lon === undefined) {
     return { valid: true };
@@ -106,13 +203,13 @@ export function validateCoordinates(lat: number | undefined, lon: number | undef
     return { valid: false, error: "Both lat and lon must be provided together" };
   }
   
-  // Check for valid coordinate ranges
+  // Check for valid coordinate ranges (boundaries are inclusive: -90 <= lat <= 90, -180 <= lon <= 180)
   if (lat < -90 || lat > 90) {
-    return { valid: false, error: "Latitude must be between -90 and 90" };
+    return { valid: false, error: "Latitude must be between -90 and 90 (inclusive)" };
   }
   
   if (lon < -180 || lon > 180) {
-    return { valid: false, error: "Longitude must be between -180 and 180" };
+    return { valid: false, error: "Longitude must be between -180 and 180 (inclusive)" };
   }
   
   // Check for NaN or Infinity
@@ -123,7 +220,14 @@ export function validateCoordinates(lat: number | undefined, lon: number | undef
   return { valid: true, lat, lon };
 }
 
-// Validate postal code format
+/**
+ * Validates and sanitizes postal codes.
+ * Strictly validates Canadian postal codes (A1A 1A1 format), but allows
+ * international postal codes to pass through for geocoding services.
+ * 
+ * @param postal - Postal code string to validate
+ * @returns Validation result with sanitized postal code or error message
+ */
 export function validatePostalCode(postal: string): { valid: boolean; sanitized?: string; error?: string } {
   if (!postal) return { valid: true };
   
@@ -131,14 +235,30 @@ export function validatePostalCode(postal: string): { valid: boolean; sanitized?
   const canadianPattern = /^[A-Za-z]\d[A-Za-z][\s]?\d[A-Za-z]\d$/;
   const sanitized = postal.replace(/\s+/g, '').toUpperCase();
   
-  if (!canadianPattern.test(sanitized)) {
-    return { valid: false, error: "Invalid Canadian postal code format" };
+  if (canadianPattern.test(sanitized)) {
+    // Valid Canadian postal code - format it properly
+    return { valid: true, sanitized: sanitized.substring(0, 3) + ' ' + sanitized.substring(3) };
   }
   
-  return { valid: true, sanitized: sanitized.substring(0, 3) + ' ' + sanitized.substring(3) };
+  // Not a Canadian postal code, but allow it to pass through for geocoding
+  // Just sanitize by removing extra spaces and converting to uppercase
+  const cleaned = postal.trim().replace(/\s+/g, ' ').toUpperCase();
+  if (cleaned.length > 0 && cleaned.length <= 20) {
+    return { valid: true, sanitized: cleaned };
+  }
+  
+  // Postal code is too long or empty after cleaning
+  return { valid: false, error: "Postal code format is invalid or too long" };
 }
 
-// Validate and sanitize query parameters
+/**
+ * Validates and sanitizes query parameters for riding lookup requests.
+ * Ensures coordinates are valid, postal codes are properly formatted,
+ * and string inputs are sanitized.
+ * 
+ * @param query - Raw query parameters from request
+ * @returns Validation result with sanitized parameters or error message
+ */
 export function validateAndSanitizeQuery(query: QueryParams): ValidationResult {
   const sanitized: QueryParams = {};
   
@@ -179,10 +299,18 @@ export function validateAndSanitizeQuery(query: QueryParams): ValidationResult {
   return { valid: true, sanitized };
 }
 
-// Retry utility function
+/**
+ * Executes an async operation with automatic retry logic using exponential backoff.
+ * 
+ * @param operation - The async function to execute
+ * @param config - Retry configuration (maxAttempts, baseDelay, maxDelay, backoffMultiplier, jitter)
+ * @param context - Context string for logging purposes
+ * @returns The result of the operation
+ * @throws The last error if all retry attempts fail
+ */
 export async function withRetry<T>(
   operation: () => Promise<T>,
-  config: RetryConfig = DEFAULT_RETRY_CONFIG,
+  config: RetryConfig = getRetryConfig(),
   context: string = 'operation'
 ): Promise<T> {
   let lastError: Error;
@@ -217,7 +345,15 @@ export async function withRetry<T>(
   throw lastError!;
 }
 
-// Timeout utility function
+/**
+ * Wraps a promise with a timeout, rejecting if the operation takes too long.
+ * 
+ * @param promise - The promise to wrap
+ * @param timeoutMs - Timeout duration in milliseconds
+ * @param operation - Operation name for error messages
+ * @returns The result of the promise if it completes within the timeout
+ * @throws Error if the operation times out
+ */
 export async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -230,8 +366,20 @@ export async function withTimeout<T>(
   return Promise.race([promise, timeoutPromise]);
 }
 
-// Rate limiting functions
+/**
+ * Checks if a client has exceeded the rate limit.
+ * Uses in-memory store with automatic cleanup to prevent memory leaks.
+ * 
+ * @param env - Environment bindings containing RATE_LIMIT configuration
+ * @param clientId - Unique identifier for the client (IP address or API key)
+ * @returns true if request is allowed, false if rate limit exceeded
+ */
 export function checkRateLimit(env: Env, clientId: string): boolean {
+  // Cleanup expired entries periodically (every 100th call to avoid overhead)
+  if (Math.random() < 0.01) {
+    cleanupRateLimitStore();
+  }
+  
   const rateLimit = env.RATE_LIMIT || DEFAULT_RATE_LIMIT;
   const now = Date.now();
   const windowMs = 60 * 1000; // 1 minute window
@@ -250,6 +398,13 @@ export function checkRateLimit(env: Env, clientId: string): boolean {
   return true;
 }
 
+/**
+ * Extracts a unique client identifier from the request for rate limiting.
+ * Prioritizes API key, then Cloudflare connecting IP, then X-Forwarded-For header.
+ * 
+ * @param request - The incoming HTTP request
+ * @returns Client identifier string (e.g., "api:key123" or "ip:1.2.3.4")
+ */
 export function getClientId(request: Request): string {
   // Use IP address or API key for rate limiting
   const apiKey = request.headers.get("X-Google-API-Key");
@@ -259,6 +414,24 @@ export function getClientId(request: Request): string {
   const xForwardedFor = request.headers.get("X-Forwarded-For");
   const ip = cfConnectingIp || xForwardedFor?.split(',')[0] || "unknown";
   return `ip:${ip}`;
+}
+
+// Generate correlation ID for request tracing
+export function generateCorrelationId(): string {
+  return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+/**
+ * Extracts correlation ID from request headers or generates a new one.
+ * Used for request tracing and debugging across distributed systems.
+ * 
+ * @param request - The incoming HTTP request
+ * @returns Correlation ID string (from X-Correlation-ID, X-Request-ID, or newly generated)
+ */
+export function getCorrelationId(request: Request): string {
+  return request.headers.get("X-Correlation-ID") || 
+         request.headers.get("X-Request-ID") || 
+         generateCorrelationId();
 }
 
 // Dataset selection
@@ -292,16 +465,40 @@ export function parseQuery(request: Request): { query: QueryParams; validation: 
   return { query: rawQuery, validation };
 }
 
-// Response utility functions
-export function badRequest(message: string, status = 400) {
-  return new Response(JSON.stringify({ error: message }), {
+// Standardized error response format
+export interface ErrorResponse {
+  error: string;
+  code?: string;
+  correlationId?: string;
+  timestamp?: number;
+  details?: Record<string, unknown>;
+}
+
+// Response utility functions with standardized error format
+export function badRequest(message: string, status = 400, code?: string, correlationId?: string, details?: Record<string, unknown>): Response {
+  const errorResponse: ErrorResponse = {
+    error: message,
+    timestamp: Date.now()
+  };
+  if (code) errorResponse.code = code;
+  if (correlationId) errorResponse.correlationId = correlationId;
+  if (details) errorResponse.details = details;
+  
+  return new Response(JSON.stringify(errorResponse), {
     status,
     headers: { "content-type": "application/json; charset=UTF-8" }
   });
 }
 
-export function unauthorizedResponse() {
-  return new Response(JSON.stringify({ error: "Unauthorized" }), {
+export function unauthorizedResponse(correlationId?: string): Response {
+  const errorResponse: ErrorResponse = {
+    error: "Unauthorized",
+    code: "UNAUTHORIZED",
+    timestamp: Date.now()
+  };
+  if (correlationId) errorResponse.correlationId = correlationId;
+  
+  return new Response(JSON.stringify(errorResponse), {
     status: 401,
     headers: { 
       "content-type": "application/json; charset=UTF-8",
@@ -310,8 +507,15 @@ export function unauthorizedResponse() {
   });
 }
 
-export function rateLimitExceededResponse() {
-  return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+export function rateLimitExceededResponse(correlationId?: string): Response {
+  const errorResponse: ErrorResponse = {
+    error: "Rate limit exceeded",
+    code: "RATE_LIMIT_EXCEEDED",
+    timestamp: Date.now()
+  };
+  if (correlationId) errorResponse.correlationId = correlationId;
+  
+  return new Response(JSON.stringify(errorResponse), {
     status: 429,
     headers: { 
       "content-type": "application/json; charset=UTF-8",
@@ -321,11 +525,28 @@ export function rateLimitExceededResponse() {
 }
 
 // Authentication
+/**
+ * Checks if the request is authorized.
+ * 
+ * Security Model:
+ * - If BASIC_AUTH is not configured, authentication is skipped (all requests allowed)
+ * - If X-Google-API-Key header is provided, basic auth is bypassed (BYOK - Bring Your Own Key)
+ *   This allows users to use their own Google Maps API key without needing the configured
+ *   basic auth credentials. Note: If the Google API key is compromised, the attacker
+ *   will have full access to the API.
+ * - Otherwise, HTTP Basic Authentication is required using the configured BASIC_AUTH secret
+ * 
+ * @param request - The incoming request
+ * @param env - Environment variables including BASIC_AUTH
+ * @returns true if authorized, false otherwise
+ */
 export function checkBasicAuth(request: Request, env: Env): boolean {
   // If BASIC_AUTH is not configured, skip authentication
   if (!env.BASIC_AUTH) return true;
   
-  // If user provides their own Google API key, bypass basic auth
+  // If user provides their own Google API key, bypass basic auth (BYOK model)
+  // SECURITY NOTE: This allows full API access with just a Google API key.
+  // Ensure Google API keys are kept secure and consider rate limiting per key.
   const googleApiKey = request.headers.get("X-Google-API-Key");
   if (googleApiKey) return true;
   

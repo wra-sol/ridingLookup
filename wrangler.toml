@@ -17,13 +17,23 @@ id = "e1ebe0d5eb39443e89d854526d97a6b6"
 name = "QUEUE_MANAGER"
 class_name = "QueueManagerDO"
 
+[[durable_objects.bindings]]
+name = "CIRCUIT_BREAKER_DO"
+class_name = "CircuitBreakerDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = [ "QueueManagerDO" ]
 
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = [ "CircuitBreakerDO" ]
+
 [vars]
-# Optional: set a geocoding provider. Supported: "nominatim" (default) or "mapbox"
+# Geocoding: GeoGratis is always used first (no configuration needed)
+# Optional: set fallback geocoding provider. Supported: "nominatim" (default), "mapbox", or "google"
 # For Mapbox, set MAPBOX_TOKEN as a secret: wrangler secret put MAPBOX_TOKEN
+# For Google, set GOOGLE_MAPS_KEY as a secret: wrangler secret put GOOGLE_MAPS_KEY
 # Basic auth credentials in format "username:password" (base64 encoded)
 # Batch processing configuration
 BATCH_SIZE = 50
@@ -32,3 +42,7 @@ RATE_LIMIT = 100
 GEOCODER = "google"
 [observability]
 enabled = true
+
+# Cron Triggers for cache warming (every 6 hours)
+[triggers]
+crons = ["0 */6 * * *"]
