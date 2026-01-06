@@ -1,8 +1,12 @@
 {
   "lockfileVersion": 1,
+  "configVersion": 0,
   "workspaces": {
     "": {
       "name": "ridinglookup",
+      "dependencies": {
+        "zod": "^3.23.8",
+      },
       "devDependencies": {
         "@cloudflare/workers-types": "^4.20250917.0",
       },
@@ -10,5 +14,7 @@
   },
   "packages": {
     "@cloudflare/workers-types": ["@cloudflare/workers-types@4.20250917.0", "", {}, "sha512-Lsn9dZoRYZZCXXHZNa50cMP8kWhQZG9M7WjxNSiXFzC8bk4Wh/0SYYo4YINxEjEt6h2o69LmAhFaJ+qgaJTh8Q=="],
+
+    "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
   }
 }
