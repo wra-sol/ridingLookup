@@ -135,6 +135,7 @@ export interface LookupResult {
 export interface LookupCacheEntry {
   properties: Record<string, unknown> | null;
   riding?: string;
+  point?: { lon: number; lat: number };
   timestamp: number;
   dataset: string;
 }

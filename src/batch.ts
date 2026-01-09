@@ -141,7 +141,7 @@ export async function processBatchLookupWithBatchGeocoding(
           // Store result in cache
           const { r2Key } = pickDataset(request.pathname);
           const dataset = r2Key.replace('.geojson', '');
-          await setCachedLookupResult(env, cacheKey, result, dataset);
+          await setCachedLookupResult(env, cacheKey, result, dataset, { lon, lat });
           
           results[index] = {
             id: request.id,
@@ -198,7 +198,7 @@ export async function processBatchLookupWithBatchGeocoding(
               // Store result in cache
               const { r2Key } = pickDataset(request.pathname);
               const dataset = r2Key.replace('.geojson', '');
-              await setCachedLookupResult(env, cacheKey, result, dataset);
+              await setCachedLookupResult(env, cacheKey, result, dataset, { lon: geocodingResult.lon, lat: geocodingResult.lat });
               
               results[index] = {
                 id: request.id,

@@ -237,8 +237,19 @@ function lookupRidingWithIndex(spatialIndex: SpatialIndex, lon: number, lat: num
   for (const feat of candidates) {
     const props = featurePropertiesIfContains(feat, lon, lat);
     if (props) {
+      // Extract riding name from properties (same logic as database lookup)
+      const englishName = props.ENGLISH_NAME;
+      const nameEn = props.NAME_EN;
+      const fedName = props.FED_NAME;
+      const ridingName = (typeof englishName === 'string' ? englishName : null) 
+        || (typeof nameEn === 'string' ? nameEn : null)
+        || (typeof fedName === 'string' ? fedName : null)
+        || undefined;
       recordTiming('totalSpatialIndexTime', Date.now() - startTime);
-      return { properties: props };
+      return { 
+        properties: props,
+        riding: ridingName
+      };
     }
   }
   
@@ -1055,11 +1066,13 @@ export default {
             incrementMetric('lookupCacheHits');
             recordTiming('totalLookupTime', Date.now() - startTime);
             const origin = request.headers.get('Origin');
+            // Use point from cache entry if available, otherwise fall back to sanitizedQuery
+            const point = cachedResult.point || (sanitizedQuery.lat !== undefined && sanitizedQuery.lon !== undefined 
+              ? { lon: sanitizedQuery.lon, lat: sanitizedQuery.lat } 
+              : undefined);
             return new Response(JSON.stringify({ 
               query: sanitizedQuery, 
-              point: sanitizedQuery.lat !== undefined && sanitizedQuery.lon !== undefined 
-                ? { lon: sanitizedQuery.lon, lat: sanitizedQuery.lat } 
-                : undefined,
+              point,
               properties: cachedResult.properties,
               riding: cachedResult.riding,
               correlationId 
@@ -1096,7 +1109,7 @@ export default {
             properties: result.properties,
             riding: result.riding
           };
-          await setCachedLookupResult(env, cacheKey, lookupResult, dataset);
+          await setCachedLookupResult(env, cacheKey, lookupResult, dataset, { lon, lat });
           
           recordTiming('totalLookupTime', Date.now() - startTime);
           const origin = request.headers.get('Origin');
