@@ -13,6 +13,7 @@ export interface Env {
   BATCH_TIMEOUT?: number;
   RATE_LIMIT?: number;
   GEOCODING_CACHE?: KVNamespace;
+  LOOKUP_CACHE?: KVNamespace;
   WEBHOOKS?: KVNamespace;
   RIDING_DB?: D1Database;
   SPATIAL_DB_ENABLED?: string; // 'true' or '1' to enable spatial database
@@ -127,6 +128,15 @@ export interface QueryParams {
 
 export interface LookupResult {
   properties: Record<string, unknown> | null;
+  riding?: string;
+}
+
+// Lookup cache entry structure
+export interface LookupCacheEntry {
+  properties: Record<string, unknown> | null;
+  riding?: string;
+  timestamp: number;
+  dataset: string;
 }
 
 // Batch processing interfaces

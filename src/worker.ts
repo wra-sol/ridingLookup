@@ -5,8 +5,6 @@ import { geocodeIfNeeded, geocodeBatch } from './geocoding';
 import { 
   geoCacheLRU, 
   spatialIndexCacheLRU, 
-  geoCache,
-  spatialIndexCache,
   getCachedGeoJSON, 
   setCachedGeoJSON, 
   getCachedSpatialIndex, 
@@ -14,7 +12,10 @@ import {
   getCachedSimplifiedBoundary,
   setCachedSimplifiedBoundary,
   performCacheWarming,
-  getCacheWarmingStatus
+  getCacheWarmingStatus,
+  generateLookupCacheKey,
+  getCachedLookupResult,
+  setCachedLookupResult
 } from './cache';
 import { initializeCircuitBreakers, geocodingCircuitBreaker, r2CircuitBreaker } from './circuit-breaker';
 import { incrementMetric, recordTiming, getMetrics, getMetricsSummary } from './metrics';
@@ -103,10 +104,14 @@ async function lookupRiding(env: Env, pathname: string, lon: number, lat: number
       try {
         const dbResult = await queryRidingFromDatabase(env, r2Key, lon, lat);
         if (dbResult) {
+          const englishName = dbResult.properties?.ENGLISH_NAME;
+          const nameEn = dbResult.properties?.NAME_EN;
+          const ridingName = (typeof englishName === 'string' ? englishName : null) 
+            || (typeof nameEn === 'string' ? nameEn : null) 
+            || 'Unknown';
           return {
-            riding: dbResult.properties?.ENGLISH_NAME || dbResult.properties?.NAME_EN || 'Unknown',
-            properties: dbResult.properties || {},
-            source: 'database'
+            riding: ridingName,
+            properties: dbResult.properties || {}
           };
         }
       } catch (error) {
@@ -114,20 +119,13 @@ async function lookupRiding(env: Env, pathname: string, lon: number, lat: number
       }
     }
     
-    // Check LRU cache first
+    // Check LRU cache
     let spatialIndex = spatialIndexCacheLRU.get(r2Key);
-    if (!spatialIndex) {
-      // Fallback to old cache
-      spatialIndex = spatialIndexCache.get(r2Key);
-      if (spatialIndex) {
-        spatialIndexCacheLRU.set(r2Key, spatialIndex);
-      }
-    }
     
     if (!spatialIndex) {
         // Load GeoJSON to create spatial index
         await loadGeo(env, r2Key);
-        spatialIndex = spatialIndexCacheLRU.get(r2Key) || spatialIndexCache.get(r2Key);
+        spatialIndex = spatialIndexCacheLRU.get(r2Key);
         if (!spatialIndex) throw new Error(`Failed to create spatial index for ${r2Key}`);
     }
     
@@ -142,21 +140,12 @@ async function loadGeo(env: Env, key: string): Promise<GeoJSONFeatureCollection>
   const startTime = Date.now();
   incrementMetric('r2Requests');
   
-  // Check LRU cache first
+  // Check LRU cache
   const cached = geoCacheLRU.get(key);
   if (cached) {
     incrementMetric('r2CacheHits');
     recordTiming('totalR2Time', Date.now() - startTime);
     return cached;
-  }
-
-  // Fallback to old cache
-  const oldCached = geoCache.get(key);
-  if (oldCached) {
-    incrementMetric('r2CacheHits');
-    geoCacheLRU.set(key, oldCached);
-    recordTiming('totalR2Time', Date.now() - startTime);
-    return oldCached;
   }
 
   incrementMetric('r2CacheMisses');
@@ -1054,6 +1043,37 @@ export default {
           // Use sanitized query parameters
           const sanitizedQuery = validation.sanitized!;
           
+          // Increment lookup requests metric (before cache check)
+          incrementMetric('lookupRequests');
+          
+          // Generate cache key
+          const cacheKey = generateLookupCacheKey(sanitizedQuery, pathname);
+          
+          // Check lookup cache
+          const cachedResult = await getCachedLookupResult(env, cacheKey);
+          if (cachedResult) {
+            incrementMetric('lookupCacheHits');
+            recordTiming('totalLookupTime', Date.now() - startTime);
+            const origin = request.headers.get('Origin');
+            return new Response(JSON.stringify({ 
+              query: sanitizedQuery, 
+              point: sanitizedQuery.lat !== undefined && sanitizedQuery.lon !== undefined 
+                ? { lon: sanitizedQuery.lon, lat: sanitizedQuery.lat } 
+                : undefined,
+              properties: cachedResult.properties,
+              riding: cachedResult.riding,
+              correlationId 
+            }), {
+              headers: { 
+                "content-type": "application/json; charset=UTF-8",
+                "X-Cache-Status": "HIT",
+                ...getCorsHeaders(origin)
+              }
+            });
+          }
+          
+          incrementMetric('lookupCacheMisses');
+          
           const timeoutConfig = getTimeoutConfig(env);
           const { lon, lat } = await withTimeout(
             geocodeIfNeeded(env, sanitizedQuery, request, undefined, geocodingCircuitBreaker ? {
@@ -1068,11 +1088,22 @@ export default {
             "Riding lookup"
           );
           
+          // Store result in cache
+          const { r2Key } = pickDataset(pathname);
+          const dataset = r2Key.replace('.geojson', '');
+          // Convert result to LookupResult format
+          const lookupResult: LookupResult = {
+            properties: result.properties,
+            riding: result.riding
+          };
+          await setCachedLookupResult(env, cacheKey, lookupResult, dataset);
+          
           recordTiming('totalLookupTime', Date.now() - startTime);
           const origin = request.headers.get('Origin');
           return new Response(JSON.stringify({ query: sanitizedQuery, point: { lon, lat }, ...result, correlationId }), {
             headers: { 
               "content-type": "application/json; charset=UTF-8",
+              "X-Cache-Status": "MISS",
               ...getCorsHeaders(origin)
             }
           });

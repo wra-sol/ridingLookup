@@ -1,6 +1,8 @@
 import { Env, BatchLookupRequest, BatchLookupResponse, BatchJob } from './types';
 import { geocodeBatch } from './geocoding';
 import { incrementMetric, recordTiming } from './metrics';
+import { generateLookupCacheKey, getCachedLookupResult, setCachedLookupResult } from './cache';
+import { pickDataset } from './utils';
 
 // Default batch size
 const DEFAULT_BATCH_SIZE = 10;
@@ -119,16 +121,36 @@ export async function processBatchLookupWithBatchGeocoding(
     for (const { request, index, lon, lat } of coordinatesProvided) {
       const startTime = Date.now();
       try {
-        const result = await lookupRiding(env, request.pathname, lon, lat);
-        const processingTime = Date.now() - startTime;
+        // Check lookup cache
+        const cacheKey = generateLookupCacheKey({ ...request.query, lon, lat }, request.pathname);
+        const cachedResult = await getCachedLookupResult(env, cacheKey);
         
-        results[index] = {
-          id: request.id,
-          query: request.query,
-          point: { lon, lat },
-          properties: result.properties,
-          processingTime
-        };
+        if (cachedResult) {
+          const processingTime = Date.now() - startTime;
+          results[index] = {
+            id: request.id,
+            query: request.query,
+            point: { lon, lat },
+            properties: cachedResult.properties,
+            processingTime
+          };
+        } else {
+          const result = await lookupRiding(env, request.pathname, lon, lat);
+          const processingTime = Date.now() - startTime;
+          
+          // Store result in cache
+          const { r2Key } = pickDataset(request.pathname);
+          const dataset = r2Key.replace('.geojson', '');
+          await setCachedLookupResult(env, cacheKey, result, dataset);
+          
+          results[index] = {
+            id: request.id,
+            query: request.query,
+            point: { lon, lat },
+            properties: result.properties,
+            processingTime
+          };
+        }
       } catch (error) {
         const processingTime = Date.now() - startTime;
         results[index] = {
@@ -153,16 +175,39 @@ export async function processBatchLookupWithBatchGeocoding(
         
         if (geocodingResult.success) {
           try {
-            const result = await lookupRiding(env, request.pathname, geocodingResult.lon, geocodingResult.lat);
-            const processingTime = Date.now() - startTime;
+            // Check lookup cache
+            const cacheKey = generateLookupCacheKey(
+              { ...request.query, lon: geocodingResult.lon, lat: geocodingResult.lat },
+              request.pathname
+            );
+            const cachedResult = await getCachedLookupResult(env, cacheKey);
             
-            results[index] = {
-              id: request.id,
-              query: request.query,
-              point: { lon: geocodingResult.lon, lat: geocodingResult.lat },
-              properties: result.properties,
-              processingTime
-            };
+            if (cachedResult) {
+              const processingTime = Date.now() - startTime;
+              results[index] = {
+                id: request.id,
+                query: request.query,
+                point: { lon: geocodingResult.lon, lat: geocodingResult.lat },
+                properties: cachedResult.properties,
+                processingTime
+              };
+            } else {
+              const result = await lookupRiding(env, request.pathname, geocodingResult.lon, geocodingResult.lat);
+              const processingTime = Date.now() - startTime;
+              
+              // Store result in cache
+              const { r2Key } = pickDataset(request.pathname);
+              const dataset = r2Key.replace('.geojson', '');
+              await setCachedLookupResult(env, cacheKey, result, dataset);
+              
+              results[index] = {
+                id: request.id,
+                query: request.query,
+                point: { lon: geocodingResult.lon, lat: geocodingResult.lat },
+                properties: result.properties,
+                processingTime
+              };
+            }
           } catch (error) {
             const processingTime = Date.now() - startTime;
             results[index] = {

@@ -13,6 +13,10 @@ bucket_name = "ridings"
 binding = "GEOCODING_CACHE"
 id = "e1ebe0d5eb39443e89d854526d97a6b6"
 
+[[kv_namespaces]]
+binding = "LOOKUP_CACHE"
+id = "4c86b30f085146429527b7b232347a79"
+
 [[durable_objects.bindings]]
 name = "QUEUE_MANAGER"
 class_name = "QueueManagerDO"

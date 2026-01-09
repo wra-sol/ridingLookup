@@ -1,11 +1,12 @@
-import { Env, GeoJSONFeatureCollection, SpatialIndex, CacheWarmingState, QueryParams } from './types';
+import { Env, GeoJSONFeatureCollection, SpatialIndex, CacheWarmingState, QueryParams, LookupResult, LookupCacheEntry } from './types';
 import { geocodeIfNeeded } from './geocoding';
-import { TIME_CONSTANTS } from './config';
+import { TIME_CONSTANTS, TIME_CONSTANTS_SECONDS } from './config';
 import { geocodingCircuitBreaker } from './circuit-breaker';
+import { pickDataset } from './utils';
 
 // Cache configuration
 export const CACHE_CONFIG = {
-  MAX_SIZE: 10, // Maximum number of datasets to cache
+  MAX_SIZE: 30, // Maximum number of datasets to cache
   MAX_AGE: TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS,
 };
 
@@ -40,9 +41,15 @@ export const CACHE_WARMING_CONFIG = {
   ]
 };
 
+// LRU Cache entry structure with timestamp
+interface CacheEntry<V> {
+  value: V;
+  timestamp: number;
+}
+
 // LRU Cache implementation
 export class LRUCache<K, V> {
-  private cache = new Map<K, V>();
+  private cache = new Map<K, CacheEntry<V>>();
   private accessOrder: K[] = [];
   private maxSize: number;
   private maxAge: number;
@@ -53,18 +60,31 @@ export class LRUCache<K, V> {
   }
 
   get(key: K): V | undefined {
-    const value = this.cache.get(key);
-    if (value) {
-      // Move to end (most recently used)
-      this.moveToEnd(key);
+    const entry = this.cache.get(key);
+    if (!entry) {
+      return undefined;
     }
-    return value;
+
+    // Check expiration
+    const age = Date.now() - entry.timestamp;
+    if (age > this.maxAge) {
+      // Entry expired, remove it
+      this.delete(key);
+      return undefined;
+    }
+
+    // Move to end (most recently used)
+    this.moveToEnd(key);
+    return entry.value;
   }
 
   set(key: K, value: V): void {
+    const now = Date.now();
+    const newEntry: CacheEntry<V> = { value, timestamp: now };
+
     // If key exists, update and move to end
     if (this.cache.has(key)) {
-      this.cache.set(key, value);
+      this.cache.set(key, newEntry);
       this.moveToEnd(key);
       return;
     }
@@ -77,12 +97,24 @@ export class LRUCache<K, V> {
       }
     }
 
-    this.cache.set(key, value);
+    this.cache.set(key, newEntry);
     this.accessOrder.push(key);
   }
 
   has(key: K): boolean {
-    return this.cache.has(key);
+    const entry = this.cache.get(key);
+    if (!entry) {
+      return false;
+    }
+
+    // Check expiration
+    const age = Date.now() - entry.timestamp;
+    if (age > this.maxAge) {
+      this.delete(key);
+      return false;
+    }
+
+    return true;
   }
 
   delete(key: K): boolean {
@@ -113,28 +145,6 @@ export class LRUCache<K, V> {
     }
   }
 }
-
-// Global cache instances with size limits to prevent memory leaks
-const MAX_GLOBAL_CACHE_SIZE = 5; // Maximum entries per global cache
-
-// Helper to enforce size limits on Maps
-function enforceCacheSizeLimit<K, V>(cache: Map<K, V>, maxSize: number): void {
-  if (cache.size > maxSize) {
-    // Remove oldest entries (first in Map iteration order)
-    const entriesToDelete = cache.size - maxSize;
-    let deleted = 0;
-    for (const key of cache.keys()) {
-      if (deleted >= entriesToDelete) break;
-      cache.delete(key);
-      deleted++;
-    }
-  }
-}
-
-// Global cache instances (kept for backward compatibility, but prefer LRU caches)
-export const geoCache = new Map<string, GeoJSONFeatureCollection>();
-export const spatialIndexCache = new Map<string, SpatialIndex>();
-export const simplifiedBoundariesCache = new Map<string, any>();
 
 // LRU cache instances
 export const geoCacheLRU = new LRUCache<string, GeoJSONFeatureCollection>(CACHE_CONFIG.MAX_SIZE, CACHE_CONFIG.MAX_AGE);
@@ -178,7 +188,12 @@ export async function warmCacheForLocation(
         await loadGeo(env, dataset.r2Key);
         
         // Perform a lookup to warm the spatial index
-        await lookupRiding(env, dataset.pathname, lon, lat);
+        const result = await lookupRiding(env, dataset.pathname, lon, lat);
+        
+        // Store lookup result in cache
+        const cacheKey = generateLookupCacheKey({ lat, lon }, dataset.pathname);
+        const datasetName = dataset.r2Key.replace('.geojson', '');
+        await setCachedLookupResult(env, cacheKey, result, datasetName);
         
         console.log(`Cache warmed for ${locationName} on ${dataset.pathname}`);
       } catch (error) {
@@ -206,8 +221,28 @@ export async function warmCacheForPostalCode(
       execute: (key: string, fn: () => Promise<any>) => geocodingCircuitBreaker.execute(key, fn)
     } : undefined);
     
-    // Warm cache for all datasets
-    return await warmCacheForLocation(env, lat, lon, `Postal Code ${postalCode}`, loadGeo, lookupRiding);
+    // Warm cache for all datasets (includes lookup cache)
+    const locationWarmed = await warmCacheForLocation(env, lat, lon, `Postal Code ${postalCode}`, loadGeo, lookupRiding);
+    
+    // Also warm lookup cache by postal code directly
+    const datasets = [
+      { pathname: "/api", r2Key: "federalridings-2024.geojson" },
+      { pathname: "/api/qc", r2Key: "quebecridings-2025.geojson" },
+      { pathname: "/api/on", r2Key: "ontarioridings-2022.geojson" }
+    ];
+    
+    for (const dataset of datasets) {
+      try {
+        const result = await lookupRiding(env, dataset.pathname, lon, lat);
+        const cacheKey = generateLookupCacheKey({ postal: postalCode }, dataset.pathname);
+        const datasetName = dataset.r2Key.replace('.geojson', '');
+        await setCachedLookupResult(env, cacheKey, result, datasetName);
+      } catch (error) {
+        console.warn(`Failed to warm lookup cache for postal code ${postalCode} on ${dataset.pathname}:`, error);
+      }
+    }
+    
+    return locationWarmed;
   } catch (error) {
     console.error(`Cache warming failed for postal code ${postalCode}:`, error);
     return false;
@@ -343,56 +378,159 @@ export function getCacheWarmingStatus(): CacheWarmingState {
 
 // Cache utility functions
 export function getCachedGeoJSON(key: string): GeoJSONFeatureCollection | undefined {
-  // Try LRU cache first
-  const cached = geoCacheLRU.get(key);
-  if (cached) {
-    return cached;
-  }
-
-  // Fallback to old cache
-  const oldCached = geoCache.get(key);
-  if (oldCached) {
-    geoCacheLRU.set(key, oldCached);
-    return oldCached;
-  }
-
-  return undefined;
+  return geoCacheLRU.get(key);
 }
 
 export function setCachedGeoJSON(key: string, data: GeoJSONFeatureCollection): void {
   geoCacheLRU.set(key, data);
-  geoCache.set(key, data);
-  enforceCacheSizeLimit(geoCache, MAX_GLOBAL_CACHE_SIZE);
 }
 
 export function getCachedSpatialIndex(key: string): SpatialIndex | undefined {
-  // Try LRU cache first
-  const cached = spatialIndexCacheLRU.get(key);
-  if (cached) {
-    return cached;
-  }
-
-  // Fallback to old cache
-  const oldCached = spatialIndexCache.get(key);
-  if (oldCached) {
-    spatialIndexCacheLRU.set(key, oldCached);
-    return oldCached;
-  }
-
-  return undefined;
+  return spatialIndexCacheLRU.get(key);
 }
 
 export function setCachedSpatialIndex(key: string, data: SpatialIndex): void {
   spatialIndexCacheLRU.set(key, data);
-  spatialIndexCache.set(key, data);
-  enforceCacheSizeLimit(spatialIndexCache, MAX_GLOBAL_CACHE_SIZE);
 }
 
+// LRU cache for simplified boundaries
+export const simplifiedBoundariesCacheLRU = new LRUCache<string, any>(CACHE_CONFIG.MAX_SIZE, CACHE_CONFIG.MAX_AGE);
+
 export function getCachedSimplifiedBoundary(cacheKey: string): any | undefined {
-  return simplifiedBoundariesCache.get(cacheKey);
+  return simplifiedBoundariesCacheLRU.get(cacheKey);
 }
 
 export function setCachedSimplifiedBoundary(cacheKey: string, geometry: any): void {
-  simplifiedBoundariesCache.set(cacheKey, geometry);
-  enforceCacheSizeLimit(simplifiedBoundariesCache, MAX_GLOBAL_CACHE_SIZE);
+  simplifiedBoundariesCacheLRU.set(cacheKey, geometry);
+}
+
+// Lookup result cache functions
+
+/**
+ * Generates a normalized cache key for lookup requests.
+ * Normalizes query parameters and coordinates to ensure consistent caching.
+ * 
+ * @param query - Query parameters (address, postal, city, state, country, lat, lon)
+ * @param pathname - API pathname (e.g., "/api", "/api/qc", "/api/on")
+ * @returns Cache key string
+ */
+export function generateLookupCacheKey(query: QueryParams, pathname: string): string {
+  const { r2Key } = pickDataset(pathname);
+  const dataset = r2Key.replace('.geojson', '');
+  
+  // Normalize coordinates to 5 decimal places (~1m precision)
+  const normalizeCoord = (coord: number | undefined): string | undefined => {
+    if (coord === undefined) return undefined;
+    return (Math.round(coord * 100000) / 100000).toString();
+  };
+  
+  // Normalize string inputs
+  const normalizeString = (str: string | undefined): string | undefined => {
+    if (!str) return undefined;
+    return str.toLowerCase().trim().replace(/\s+/g, ' ');
+  };
+  
+  // Determine cache key type and value
+  let type: string;
+  let value: string;
+  
+  if (query.lat !== undefined && query.lon !== undefined) {
+    // Use coordinates
+    type = 'coordinate';
+    const latNorm = normalizeCoord(query.lat);
+    const lonNorm = normalizeCoord(query.lon);
+    value = `${lonNorm},${latNorm}`;
+  } else if (query.postal) {
+    // Use postal code
+    type = 'postal';
+    value = normalizeString(query.postal)?.replace(/\s+/g, '') || '';
+  } else if (query.address) {
+    // Use address
+    type = 'address';
+    const parts: string[] = [];
+    if (query.address) parts.push(normalizeString(query.address) || '');
+    if (query.city) parts.push(normalizeString(query.city) || '');
+    if (query.state) parts.push(normalizeString(query.state) || '');
+    if (query.country) parts.push(normalizeString(query.country) || '');
+    value = parts.filter(Boolean).join(' ');
+  } else {
+    // Fallback: use all available parameters
+    type = 'query';
+    const parts: string[] = [];
+    if (query.city) parts.push(normalizeString(query.city) || '');
+    if (query.state) parts.push(normalizeString(query.state) || '');
+    if (query.country) parts.push(normalizeString(query.country) || '');
+    value = parts.filter(Boolean).join(' ') || 'unknown';
+  }
+  
+  // Ensure key doesn't exceed KV 512 byte limit
+  const key = `lookup:${dataset}:${type}:${value}:${pathname}`;
+  if (key.length > 512) {
+    // Hash long keys (simple hash for now)
+    const hash = key.split('').reduce((acc, char) => {
+      const hash = ((acc << 5) - acc) + char.charCodeAt(0);
+      return hash & hash;
+    }, 0);
+    return `lookup:${dataset}:${type}:hash:${Math.abs(hash)}:${pathname}`;
+  }
+  
+  return key;
+}
+
+/**
+ * Retrieves a cached lookup result from KV storage.
+ * Validates cache entry age (24 hour TTL) and returns null if expired.
+ * 
+ * @param env - Environment bindings containing LOOKUP_CACHE KV namespace
+ * @param cacheKey - Cache key generated by generateLookupCacheKey
+ * @returns Cached lookup result, or null if not found/expired
+ */
+export async function getCachedLookupResult(env: Env, cacheKey: string): Promise<LookupCacheEntry | null> {
+  if (!env.LOOKUP_CACHE) return null;
+  
+  try {
+    const cached = await env.LOOKUP_CACHE.get(cacheKey, 'json') as LookupCacheEntry | null;
+    if (!cached) return null;
+    
+    // Check if cache entry is still valid (24 hours TTL)
+    const maxAge = TIME_CONSTANTS.TWENTY_FOUR_HOURS_MS;
+    if (Date.now() - cached.timestamp > maxAge) {
+      await env.LOOKUP_CACHE.delete(cacheKey);
+      return null;
+    }
+    
+    return cached;
+  } catch (error) {
+    console.warn('Failed to get cached lookup result:', error);
+    return null;
+  }
+}
+
+/**
+ * Stores a lookup result in KV cache with 24-hour TTL.
+ * 
+ * @param env - Environment bindings containing LOOKUP_CACHE KV namespace
+ * @param cacheKey - Cache key generated by generateLookupCacheKey
+ * @param result - Lookup result to cache
+ * @param dataset - Dataset identifier (e.g., "federalridings-2024")
+ */
+export async function setCachedLookupResult(env: Env, cacheKey: string, result: LookupResult, dataset: string): Promise<void> {
+  if (!env.LOOKUP_CACHE) return;
+  
+  try {
+    const entry: LookupCacheEntry = {
+      properties: result.properties,
+      riding: result.riding,
+      timestamp: Date.now(),
+      dataset
+    };
+    
+    // Store with 24 hour TTL
+    await env.LOOKUP_CACHE.put(cacheKey, JSON.stringify(entry), {
+      expirationTtl: TIME_CONSTANTS_SECONDS.TWENTY_FOUR_HOURS
+    });
+  } catch (error) {
+    console.warn('Failed to cache lookup result:', error);
+    // Don't throw - cache errors should never fail requests
+  }
 }
