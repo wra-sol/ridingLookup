@@ -437,6 +437,7 @@ export function getCorrelationId(request: Request): string {
 // Dataset selection
 export function pickDataset(pathname: string): { r2Key: string } {
   // Map routes to R2 object keys
+  if (pathname === "/api/federal") return { r2Key: "federalridings-2024.geojson" };
   if (pathname === "/api/qc") return { r2Key: "quebecridings-2025.geojson" };
   if (pathname === "/api/on") return { r2Key: "ontarioridings-2022.geojson" };
   // default federal
