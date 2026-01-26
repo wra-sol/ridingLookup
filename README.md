@@ -6,9 +6,11 @@ A comprehensive API service for finding Canadian electoral district (riding) inf
 
 The API provides lookup endpoints for different levels of government:
 
-- `GET /api` — Federal ridings (2024 boundaries)
+- `GET /api/federal` — Federal ridings (2024 boundaries)
+- `GET /api` — Alias of `/api/federal` for backwards compatibility
 - `GET /api/qc` — Quebec provincial ridings (2025 boundaries)  
 - `GET /api/on` — Ontario provincial ridings (2022 boundaries)
+- `GET /api/combined` — Returns federal data plus the matching provincial result (Ontario or Quebec) under `province_data`
 
 ### Query Parameters
 
