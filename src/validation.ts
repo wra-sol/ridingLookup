@@ -59,6 +59,7 @@ export const GoogleBatchGeocodeResultItemSchema = z.object({
   place_id: z.string().optional(),
   postcode_localities: z.array(z.string()).optional(),
   types: z.array(z.string()).optional(),
+  address_components: z.array(z.any()).optional(),
   geometry: z.object({
     location: z.object({
       lat: z.number(),

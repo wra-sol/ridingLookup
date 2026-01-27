@@ -51,6 +51,55 @@ export interface GoogleGeocodeResponse {
   results: GoogleGeocodeResult[]; 
 }
 
+// Google Address Components - structured breakdown of address parts
+export interface GoogleAddressComponents {
+  street_number?: string;
+  route?: string; // Street name
+  subpremise?: string; // Apartment, suite, etc.
+  locality?: string; // City
+  administrative_area_level_1?: string; // State/Province
+  administrative_area_level_2?: string; // County
+  administrative_area_level_3?: string;
+  administrative_area_level_4?: string;
+  administrative_area_level_5?: string;
+  country?: string;
+  postal_code?: string;
+  postal_code_suffix?: string;
+  neighborhood?: string;
+  sublocality?: string;
+  sublocality_level_1?: string;
+  sublocality_level_2?: string;
+  sublocality_level_3?: string;
+  sublocality_level_4?: string;
+  sublocality_level_5?: string;
+  premise?: string; // Building name
+  establishment?: string;
+  point_of_interest?: string;
+  park?: string;
+  street_address?: string;
+  intersection?: string;
+  political?: string;
+  colloquial_area?: string;
+  ward?: string;
+  // Additional fields from Google response
+  formatted_address?: string;
+  place_id?: string;
+  types?: string[];
+  plus_code?: {
+    compound_code?: string;
+    global_code?: string;
+  };
+  // Viewport and bounds
+  viewport?: {
+    northeast: GoogleGeocodeLocation;
+    southwest: GoogleGeocodeLocation;
+  };
+  bounds?: {
+    northeast: GoogleGeocodeLocation;
+    southwest: GoogleGeocodeLocation;
+  };
+}
+
 // GeoGratis Geolocation API interfaces
 export interface GeoGratisGeometry {
   type: string;
@@ -84,6 +133,7 @@ export interface GoogleBatchGeocodeResponse {
     place_id: string;
     postcode_localities: string[];
     types: string[];
+    address_components?: any[];
     geometry: {
       location: {
         lat: number;
@@ -130,6 +180,7 @@ export interface LookupResult {
   properties: Record<string, unknown> | null;
   riding?: string;
   normalizedAddress?: string;
+  addressComponents?: GoogleAddressComponents;
 }
 
 // Lookup cache entry structure
@@ -138,6 +189,7 @@ export interface LookupCacheEntry {
   riding?: string;
   point?: { lon: number; lat: number };
   normalizedAddress?: string;
+  addressComponents?: GoogleAddressComponents;
   timestamp: number;
   dataset: string;
 }
@@ -163,6 +215,7 @@ export interface BatchLookupResponse {
   point?: { lon: number; lat: number };
   properties: Record<string, unknown> | null;
   normalizedAddress?: string;
+  addressComponents?: GoogleAddressComponents;
   error?: string;
   processingTime: number;
 }

@@ -7,7 +7,8 @@ import {
   GoogleBatchGeocodeRequest,
   GoogleBatchGeocodeResponse,
   GeoGratisResponse,
-  GeoGratisResult
+  GeoGratisResult,
+  GoogleAddressComponents
 } from './types';
 import { getTimeoutConfig, getRetryConfig, TIME_CONSTANTS, TIME_CONSTANTS_SECONDS, QUALITY_THRESHOLDS } from './config';
 import { 
@@ -186,12 +187,97 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation:
   return Promise.race([promise, timeoutPromise]);
 }
 
-export type GeocodeResult = { lon: number; lat: number; normalizedAddress?: string };
+export type GeocodeResult = { lon: number; lat: number; normalizedAddress?: string; addressComponents?: GoogleAddressComponents };
 
-export type GeocodeBatchResult = { lon: number; lat: number; success: boolean; error?: string; normalizedAddress?: string };
+export type GeocodeBatchResult = { lon: number; lat: number; success: boolean; error?: string; normalizedAddress?: string; addressComponents?: GoogleAddressComponents };
 
 /**
- * Reverse-geocodes (lat, lon) via Google Geocoding API to obtain a normalized formatted address.
+ * Parses Google address_components array into structured address components object.
+ * Extracts all available address parts from Google's response.
+ */
+function parseGoogleAddressComponents(result: any): GoogleAddressComponents | undefined {
+  if (!result || !result.address_components || !Array.isArray(result.address_components)) {
+    return undefined;
+  }
+
+  const components: GoogleAddressComponents = {};
+  
+  // Helper to find component by type
+  const getComponent = (types: string[]): string | undefined => {
+    const component = result.address_components.find((comp: any) => 
+      comp.types && Array.isArray(comp.types) && types.some(type => comp.types.includes(type))
+    );
+    return component?.long_name || component?.short_name;
+  };
+
+  // Extract all address components
+  components.street_number = getComponent(['street_number']);
+  components.route = getComponent(['route']);
+  components.subpremise = getComponent(['subpremise']);
+  components.locality = getComponent(['locality']);
+  components.administrative_area_level_1 = getComponent(['administrative_area_level_1']);
+  components.administrative_area_level_2 = getComponent(['administrative_area_level_2']);
+  components.administrative_area_level_3 = getComponent(['administrative_area_level_3']);
+  components.administrative_area_level_4 = getComponent(['administrative_area_level_4']);
+  components.administrative_area_level_5 = getComponent(['administrative_area_level_5']);
+  components.country = getComponent(['country']);
+  components.postal_code = getComponent(['postal_code']);
+  components.postal_code_suffix = getComponent(['postal_code_suffix']);
+  components.neighborhood = getComponent(['neighborhood', 'sublocality']);
+  components.sublocality = getComponent(['sublocality']);
+  components.sublocality_level_1 = getComponent(['sublocality_level_1']);
+  components.sublocality_level_2 = getComponent(['sublocality_level_2']);
+  components.sublocality_level_3 = getComponent(['sublocality_level_3']);
+  components.sublocality_level_4 = getComponent(['sublocality_level_4']);
+  components.sublocality_level_5 = getComponent(['sublocality_level_5']);
+  components.premise = getComponent(['premise']);
+  components.establishment = getComponent(['establishment']);
+  components.point_of_interest = getComponent(['point_of_interest']);
+  components.park = getComponent(['park']);
+  components.street_address = getComponent(['street_address']);
+  components.intersection = getComponent(['intersection']);
+  components.political = getComponent(['political']);
+  components.colloquial_area = getComponent(['colloquial_area']);
+  components.ward = getComponent(['ward']);
+
+  // Add formatted address and other metadata
+  if (result.formatted_address) {
+    components.formatted_address = result.formatted_address;
+  }
+  if (result.place_id) {
+    components.place_id = result.place_id;
+  }
+  if (result.types && Array.isArray(result.types)) {
+    components.types = result.types;
+  }
+  if (result.plus_code) {
+    components.plus_code = result.plus_code;
+  }
+  if (result.geometry?.viewport) {
+    components.viewport = {
+      northeast: result.geometry.viewport.northeast,
+      southwest: result.geometry.viewport.southwest
+    };
+  }
+  if (result.geometry?.bounds) {
+    components.bounds = {
+      northeast: result.geometry.bounds.northeast,
+      southwest: result.geometry.bounds.southwest
+    };
+  }
+
+  // Only return if we have at least some components
+  const hasAnyComponent = Object.keys(components).some(key => 
+    key !== 'formatted_address' && key !== 'place_id' && key !== 'types' && 
+    key !== 'plus_code' && key !== 'viewport' && key !== 'bounds' && 
+    components[key as keyof GoogleAddressComponents] !== undefined
+  );
+
+  return hasAnyComponent || components.formatted_address ? components : undefined;
+}
+
+/**
+ * Reverse-geocodes (lat, lon) via Google Geocoding API to obtain a normalized formatted address and components.
  * Uses X-Google-API-Key header or GOOGLE_MAPS_KEY env. Returns null if no key, ZERO_RESULTS, or error.
  */
 export async function normalizeAddressWithGoogle(
@@ -200,12 +286,12 @@ export async function normalizeAddressWithGoogle(
   lon: number,
   request?: Request,
   circuitBreaker?: { execute: (key: string, fn: () => Promise<any>) => Promise<any> }
-): Promise<string | null> {
+): Promise<{ formattedAddress: string; components: GoogleAddressComponents } | null> {
   const headerKey = request?.headers.get('X-Google-API-Key');
   const key = headerKey || env.GOOGLE_MAPS_KEY;
   if (!key) return null;
 
-  const doReverse = async (): Promise<string | null> => {
+  const doReverse = async (): Promise<{ formattedAddress: string; components: GoogleAddressComponents } | null> => {
     const params = new URLSearchParams({
       latlng: `${lat},${lon}`,
       key,
@@ -219,8 +305,23 @@ export async function normalizeAddressWithGoogle(
     if (!validation.success) return null;
     const data = validation.data;
     if (data.status !== 'OK' || !data.results?.length) return null;
-    const addr = data.results[0].formatted_address;
-    return typeof addr === 'string' && addr.length > 0 ? addr : null;
+    
+    const result = data.results[0];
+    const formattedAddress = result.formatted_address;
+    if (typeof formattedAddress !== 'string' || formattedAddress.length === 0) {
+      return null;
+    }
+
+    const components = parseGoogleAddressComponents(result);
+    if (!components) {
+      // Still return formatted address even if components parsing fails
+      return {
+        formattedAddress,
+        components: { formatted_address: formattedAddress }
+      };
+    }
+
+    return { formattedAddress, components };
   };
 
   try {
@@ -442,14 +543,14 @@ export async function geocodeIfNeeded(
           if (!key) throw new Error("Google API key not provided. Set X-Google-API-Key header or configure GOOGLE_MAPS_KEY environment variable");
           const params = new URLSearchParams({ key });
           // Prefer structured components when available
-          const components: string[] = [];
-          if (qp.postal) components.push(`postal_code:${qp.postal.replace(/\s+/g, '')}`);
-          if (qp.city) components.push(`locality:${qp.city}`);
-          if (qp.state) components.push(`administrative_area:${qp.state}`);
+          const componentFilters: string[] = [];
+          if (qp.postal) componentFilters.push(`postal_code:${qp.postal.replace(/\s+/g, '')}`);
+          if (qp.city) componentFilters.push(`locality:${qp.city}`);
+          if (qp.state) componentFilters.push(`administrative_area:${qp.state}`);
           // Default to Canada unless caller specifies
           const country = (qp.country || 'CA').toUpperCase();
-          components.push(`country:${country}`);
-          if (components.length) params.set("components", components.join("|"));
+          componentFilters.push(`country:${country}`);
+          if (componentFilters.length) params.set("components", componentFilters.join("|"));
           if (qp.address) params.set("address", qp.address);
           // Region bias for Canada
           params.set('region', 'ca');
@@ -504,12 +605,16 @@ export async function geocodeIfNeeded(
             throw new Error(`Google API error: ${data.status}`);
           }
           
-          const loc = data.results[0].geometry.location;
-          const fmt = data.results[0].formatted_address;
+          const result = data.results[0];
+          const loc = result.geometry.location;
+          const fmt = result.formatted_address;
+          const components = parseGoogleAddressComponents(result);
+          
           geocodeResult = {
             lon: loc.lng,
             lat: loc.lat,
-            ...(typeof fmt === 'string' && fmt.length > 0 && { normalizedAddress: fmt })
+            ...(typeof fmt === 'string' && fmt.length > 0 && { normalizedAddress: fmt }),
+            ...(components && { addressComponents: components })
           };
         } else if (provider === "mapbox") {
           const token = env.MAPBOX_TOKEN;
@@ -657,10 +762,24 @@ export async function geocodeBatchWithGoogle(
         const query = queries[i];
         
         if (result.geometry?.location) {
+          // Parse address components if available in batch response
+          // Note: Google batch API may have different structure, so we try to extract what we can
+          const addressComponents = result.address_components 
+            ? parseGoogleAddressComponents({ 
+                address_components: result.address_components, 
+                formatted_address: result.geocoded_address, 
+                place_id: result.place_id, 
+                types: result.types,
+                geometry: result.geometry
+              })
+            : undefined;
+          
           results.push({
             lon: result.geometry.location.lng,
             lat: result.geometry.location.lat,
-            success: true
+            success: true,
+            ...(result.geocoded_address && { normalizedAddress: result.geocoded_address }),
+            ...(addressComponents && { addressComponents })
           });
           successCount++;
         } else {

@@ -1079,6 +1079,7 @@ export default {
               properties: cachedResult.properties,
               riding: cachedResult.riding,
               ...(cachedResult.normalizedAddress && { normalizedAddress: cachedResult.normalizedAddress }),
+              ...(cachedResult.addressComponents && { addressComponents: cachedResult.addressComponents }),
               correlationId
             }), {
               headers: { 
@@ -1100,9 +1101,17 @@ export default {
           );
           const { lon, lat } = geocodeResult;
           let normalizedAddress = geocodeResult.normalizedAddress;
-          if (!normalizedAddress && (request?.headers.get('X-Google-API-Key') || env.GOOGLE_MAPS_KEY)) {
-            normalizedAddress = await normalizeAddressWithGoogle(env, geocodeResult.lat, geocodeResult.lon, request, cb) ?? undefined;
+          let addressComponents = geocodeResult.addressComponents;
+          
+          // If we don't have address components yet, try to get them via reverse geocoding
+          if (!addressComponents && (request?.headers.get('X-Google-API-Key') || env.GOOGLE_MAPS_KEY)) {
+            const googleResult = await normalizeAddressWithGoogle(env, geocodeResult.lat, geocodeResult.lon, request, cb);
+            if (googleResult) {
+              normalizedAddress = googleResult.formattedAddress;
+              addressComponents = googleResult.components;
+            }
           }
+          
           const result = await withTimeout(
             lookupRiding(env, pathname, lon, lat),
             timeoutConfig.lookup,
@@ -1114,7 +1123,8 @@ export default {
           const lookupResult: LookupResult = {
             properties: result.properties,
             riding: result.riding,
-            ...(normalizedAddress && { normalizedAddress })
+            ...(normalizedAddress && { normalizedAddress }),
+            ...(addressComponents && { addressComponents })
           };
           await setCachedLookupResult(env, cacheKey, lookupResult, dataset, { lon, lat });
           
@@ -1125,6 +1135,7 @@ export default {
             point: { lon, lat },
             ...result,
             ...(normalizedAddress && { normalizedAddress }),
+            ...(addressComponents && { addressComponents }),
             correlationId
           }), {
             headers: { 
