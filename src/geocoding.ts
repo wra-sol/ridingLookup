@@ -28,10 +28,11 @@ interface GeocodingCacheEntry {
   score?: number; // GeoGratis quality score (0-1)
 }
 
+// GeoGratis-first for geolocation; normalization via Google reverse geocode when key is set.
 const BATCH_GEOCODING_CONFIG = {
   ENABLED: true,
   MAX_BATCH_SIZE: 10,
-  PROVIDER: 'google' // 'google' or 'individual'
+  PROVIDER: 'individual' as 'individual' | 'google' // 'individual' = GeoGratis-first; 'google' = batch Google (optional fallback)
 };
 
 // Use quality threshold from config
@@ -185,6 +186,56 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation:
   return Promise.race([promise, timeoutPromise]);
 }
 
+export type GeocodeResult = { lon: number; lat: number; normalizedAddress?: string };
+
+export type GeocodeBatchResult = { lon: number; lat: number; success: boolean; error?: string; normalizedAddress?: string };
+
+/**
+ * Reverse-geocodes (lat, lon) via Google Geocoding API to obtain a normalized formatted address.
+ * Uses X-Google-API-Key header or GOOGLE_MAPS_KEY env. Returns null if no key, ZERO_RESULTS, or error.
+ */
+export async function normalizeAddressWithGoogle(
+  env: Env,
+  lat: number,
+  lon: number,
+  request?: Request,
+  circuitBreaker?: { execute: (key: string, fn: () => Promise<any>) => Promise<any> }
+): Promise<string | null> {
+  const headerKey = request?.headers.get('X-Google-API-Key');
+  const key = headerKey || env.GOOGLE_MAPS_KEY;
+  if (!key) return null;
+
+  const doReverse = async (): Promise<string | null> => {
+    const params = new URLSearchParams({
+      latlng: `${lat},${lon}`,
+      key,
+      region: 'ca'
+    });
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`;
+    const resp = await fetch(url, { headers: { 'User-Agent': 'riding-lookup/1.0' } });
+    if (!resp.ok) return null;
+    const rawData = await resp.json();
+    const validation = safeValidateGoogleGeocode(rawData);
+    if (!validation.success) return null;
+    const data = validation.data;
+    if (data.status !== 'OK' || !data.results?.length) return null;
+    const addr = data.results[0].formatted_address;
+    return typeof addr === 'string' && addr.length > 0 ? addr : null;
+  };
+
+  try {
+    const timeoutConfig = getTimeoutConfig(env);
+    const timeoutMs = Math.min(timeoutConfig.geocoding, 5000);
+    const fn = () => withTimeout(doReverse(), timeoutMs, 'Google reverse geocode');
+    const out = circuitBreaker
+      ? await circuitBreaker.execute('geocoding:google-reverse', fn)
+      : await fn();
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Geocodes an address using the GeoGratis Geolocation API (Government of Canada).
  * This is the primary geocoding service used by the application.
@@ -282,11 +333,12 @@ async function geocodeWithGeoGratis(qp: QueryParams): Promise<{ lon: number; lat
  * Geocodes a query (address/postal code) to coordinates if needed.
  * Uses cached results when available, with quality-aware caching for GeoGratis.
  * Falls back through multiple providers: GeoGratis -> Google -> Mapbox -> Nominatim.
+ * When Google is used for forward geocoding, returns normalizedAddress (formatted_address).
  * 
  * @param env - Environment bindings (API keys, KV cache)
  * @param query - Query parameters (address, postal, city, state, country)
  * @param request - Optional request object for extracting Google API key from headers
- * @returns Promise resolving to {lon, lat} coordinates
+ * @returns Promise resolving to {lon, lat, normalizedAddress?} coordinates
  * @throws Error if geocoding fails for all providers
  */
 export async function geocodeIfNeeded(
@@ -300,7 +352,7 @@ export async function geocodeIfNeeded(
   circuitBreaker?: {
     execute: (key: string, fn: () => Promise<any>) => Promise<any>;
   }
-): Promise<{ lon: number; lat: number; }> {
+): Promise<GeocodeResult> {
   if (typeof qp.lat === "number" && typeof qp.lon === "number") {
     return { lon: qp.lon, lat: qp.lat };
   }
@@ -327,7 +379,7 @@ export async function geocodeIfNeeded(
         // Cached result is good quality
         metrics?.incrementMetric('geocodingCacheHits');
         metrics?.recordTiming('totalGeocodingTime', Date.now() - startTime);
-        return { lon: geogratisCached.lon, lat: geogratisCached.lat };
+        return { lon: geogratisCached.lon, lat: geogratisCached.lat } as GeocodeResult;
       } else {
         // Cached result was poor quality, try fresh lookup
         console.warn(`[GEOCODING] Cached GeoGratis result was ${isInterpolated ? 'interpolated' : 'poor quality'}, fetching fresh result`);
@@ -352,7 +404,7 @@ export async function geocodeIfNeeded(
           await setCachedGeocoding(env, geogratisCacheKey, geogratisResult.lon, geogratisResult.lat, 'geogratis', geogratisResult.qualifier, geogratisResult.score);
           metrics?.incrementMetric('geocodingSuccesses');
           metrics?.recordTiming('totalGeocodingTime', Date.now() - startTime);
-          return { lon: geogratisResult.lon, lat: geogratisResult.lat };
+          return { lon: geogratisResult.lon, lat: geogratisResult.lat } as GeocodeResult;
         }
       } else {
         // GeoGratis failed
@@ -372,16 +424,16 @@ export async function geocodeIfNeeded(
     if (cached) {
       metrics?.incrementMetric('geocodingCacheHits');
       metrics?.recordTiming('totalGeocodingTime', Date.now() - startTime);
-      return cached;
+      return { lon: cached.lon, lat: cached.lat } as GeocodeResult;
     }
     
     metrics?.incrementMetric('geocodingCacheMisses');
     
     // Use circuit breaker and retry for geocoding
-    let result: { lon: number; lat: number };
+    let result: GeocodeResult;
     try {
-      const geocodeFn = async () => {
-        let geocodeResult: { lon: number; lat: number };
+      const geocodeFn = async (): Promise<GeocodeResult> => {
+        let geocodeResult: GeocodeResult;
     
         if (provider === "google") {
           // Check for Google API key in header first, then fall back to environment variable
@@ -453,7 +505,12 @@ export async function geocodeIfNeeded(
           }
           
           const loc = data.results[0].geometry.location;
-          geocodeResult = { lon: loc.lng, lat: loc.lat };
+          const fmt = data.results[0].formatted_address;
+          geocodeResult = {
+            lon: loc.lng,
+            lat: loc.lat,
+            ...(typeof fmt === 'string' && fmt.length > 0 && { normalizedAddress: fmt })
+          };
         } else if (provider === "mapbox") {
           const token = env.MAPBOX_TOKEN;
           if (!token) throw new Error("MAPBOX_TOKEN not configured");
@@ -466,6 +523,7 @@ export async function geocodeIfNeeded(
           if (!feat?.center) throw new Error("No results from Mapbox");
           geocodeResult = { lon: feat.center[0], lat: feat.center[1] };
         } else {
+          // Nominatim
           // Default to Nominatim (OpenStreetMap)
           const nominatimParams = new URLSearchParams({ format: "jsonv2", limit: "1", country: "canada" });
           if (qp.address) nominatimParams.set("street", qp.address);
@@ -492,7 +550,6 @@ export async function geocodeIfNeeded(
           if (!first) throw new Error("No results from Nominatim");
           geocodeResult = { lon: Number(first.lon), lat: Number(first.lat) };
         }
-        
         return geocodeResult;
       };
 
@@ -531,8 +588,8 @@ export async function geocodeBatchWithGoogle(
   env: Env, 
   queries: QueryParams[], 
   apiKey: string
-): Promise<Array<{ lon: number; lat: number; success: boolean; error?: string }>> {
-  const results: Array<{ lon: number; lat: number; success: boolean; error?: string }> = [];
+): Promise<GeocodeBatchResult[]> {
+  const results: GeocodeBatchResult[] = [];
   const errors: string[] = [];
   
   // Convert queries to Google batch format
@@ -699,12 +756,12 @@ export async function geocodeBatch(
   circuitBreaker?: {
     execute: (key: string, fn: () => Promise<any>) => Promise<any>;
   }
-): Promise<Array<{ lon: number; lat: number; success: boolean; error?: string }>> {
+): Promise<GeocodeBatchResult[]> {
   if (!BATCH_GEOCODING_CONFIG.ENABLED || queries.length === 0) {
     return [];
   }
 
-  const results: Array<{ lon: number; lat: number; success: boolean; error?: string }> = [];
+  const results: GeocodeBatchResult[] = [];
   
   // Process in batches
   const batchSize = BATCH_GEOCODING_CONFIG.MAX_BATCH_SIZE;
@@ -716,35 +773,34 @@ export async function geocodeBatch(
         const batchResults = await geocodeBatchWithGoogle(env, batch, env.GOOGLE_MAPS_KEY);
         results.push(...batchResults);
       } else {
-        // Individual geocoding fallback
+        // GeoGratis-first individual geocoding
         for (const query of batch) {
           try {
             const result = await geocodeIfNeeded(env, query, request, metrics, circuitBreaker);
-            results.push({ ...result, success: true });
+            results.push({ lon: result.lon, lat: result.lat, success: true, normalizedAddress: result.normalizedAddress });
           } catch (error) {
-            results.push({ 
-              lon: 0, 
-              lat: 0, 
-              success: false, 
-              error: error instanceof Error ? error.message : 'Geocoding failed' 
+            results.push({
+              lon: 0,
+              lat: 0,
+              success: false,
+              error: error instanceof Error ? error.message : 'Geocoding failed'
             });
           }
         }
       }
     } catch (error) {
       console.error(`Batch geocoding failed for batch ${i / BATCH_GEOCODING_CONFIG.MAX_BATCH_SIZE + 1}:`, error);
-      
-      // Fallback to individual geocoding for this batch
+
       for (const query of batch) {
         try {
           const result = await geocodeIfNeeded(env, query, request, metrics, circuitBreaker);
-          results.push({ ...result, success: true });
+          results.push({ lon: result.lon, lat: result.lat, success: true, normalizedAddress: result.normalizedAddress });
         } catch (individualError) {
-          results.push({ 
-            lon: 0, 
-            lat: 0, 
-            success: false, 
-            error: individualError instanceof Error ? individualError.message : 'Geocoding failed' 
+          results.push({
+            lon: 0,
+            lat: 0,
+            success: false,
+            error: individualError instanceof Error ? individualError.message : 'Geocoding failed'
           });
         }
       }

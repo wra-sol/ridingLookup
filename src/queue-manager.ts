@@ -44,6 +44,7 @@ export interface BatchLookupResponse {
   query: QueryParams;
   point?: { lon: number; lat: number };
   properties: Record<string, unknown> | null;
+  normalizedAddress?: string;
   error?: string;
   processingTime: number;
 }

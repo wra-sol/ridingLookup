@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { Env, QueryParams, LookupResult, GeoJSONFeatureCollection, SpatialIndex } from './types';
-import { geocodeIfNeeded, geocodeBatch } from './geocoding';
+import { geocodeIfNeeded, geocodeBatch, normalizeAddressWithGoogle } from './geocoding';
 import { 
   geoCacheLRU, 
   spatialIndexCacheLRU, 
@@ -826,12 +826,15 @@ export default {
               pathname: req.pathname || '/api'
             }));
             
+            const cb = geocodingCircuitBreaker ? { execute: (k: string, fn: () => Promise<any>) => geocodingCircuitBreaker!.execute(k, fn) } : undefined;
             const results = await processBatchLookupWithBatchGeocoding(
-              env, 
-              requests, 
-              geocodeIfNeeded, 
-              lookupRiding, 
-              geocodeBatch
+              env,
+              requests,
+              geocodeIfNeeded,
+              lookupRiding,
+              (e, q, req?, c?) => geocodeBatch(e, q, req, undefined, c ?? cb),
+              request,
+              cb
             );
             
             return new Response(JSON.stringify({ results }), {
@@ -1070,12 +1073,13 @@ export default {
             const point = cachedResult.point || (sanitizedQuery.lat !== undefined && sanitizedQuery.lon !== undefined 
               ? { lon: sanitizedQuery.lon, lat: sanitizedQuery.lat } 
               : undefined);
-            return new Response(JSON.stringify({ 
-              query: sanitizedQuery, 
+            return new Response(JSON.stringify({
+              query: sanitizedQuery,
               point,
               properties: cachedResult.properties,
               riding: cachedResult.riding,
-              correlationId 
+              ...(cachedResult.normalizedAddress && { normalizedAddress: cachedResult.normalizedAddress }),
+              correlationId
             }), {
               headers: { 
                 "content-type": "application/json; charset=UTF-8",
@@ -1088,32 +1092,41 @@ export default {
           incrementMetric('lookupCacheMisses');
           
           const timeoutConfig = getTimeoutConfig(env);
-          const { lon, lat } = await withTimeout(
-            geocodeIfNeeded(env, sanitizedQuery, request, undefined, geocodingCircuitBreaker ? {
-              execute: (key: string, fn: () => Promise<any>) => geocodingCircuitBreaker.execute(key, fn)
-            } : undefined),
+          const cb = geocodingCircuitBreaker ? { execute: (k: string, fn: () => Promise<any>) => geocodingCircuitBreaker!.execute(k, fn) } : undefined;
+          const geocodeResult = await withTimeout(
+            geocodeIfNeeded(env, sanitizedQuery, request, undefined, cb),
             timeoutConfig.geocoding,
             "Geocoding"
           );
+          const { lon, lat } = geocodeResult;
+          let normalizedAddress = geocodeResult.normalizedAddress;
+          if (!normalizedAddress && (request?.headers.get('X-Google-API-Key') || env.GOOGLE_MAPS_KEY)) {
+            normalizedAddress = await normalizeAddressWithGoogle(env, geocodeResult.lat, geocodeResult.lon, request, cb) ?? undefined;
+          }
           const result = await withTimeout(
             lookupRiding(env, pathname, lon, lat),
             timeoutConfig.lookup,
             "Riding lookup"
           );
           
-          // Store result in cache
           const { r2Key } = pickDataset(pathname);
           const dataset = r2Key.replace('.geojson', '');
-          // Convert result to LookupResult format
           const lookupResult: LookupResult = {
             properties: result.properties,
-            riding: result.riding
+            riding: result.riding,
+            ...(normalizedAddress && { normalizedAddress })
           };
           await setCachedLookupResult(env, cacheKey, lookupResult, dataset, { lon, lat });
           
           recordTiming('totalLookupTime', Date.now() - startTime);
           const origin = request.headers.get('Origin');
-          return new Response(JSON.stringify({ query: sanitizedQuery, point: { lon, lat }, ...result, correlationId }), {
+          return new Response(JSON.stringify({
+            query: sanitizedQuery,
+            point: { lon, lat },
+            ...result,
+            ...(normalizedAddress && { normalizedAddress }),
+            correlationId
+          }), {
             headers: { 
               "content-type": "application/json; charset=UTF-8",
               "X-Cache-Status": "MISS",

@@ -1,5 +1,5 @@
 import { Env, BatchLookupRequest, BatchLookupResponse, BatchJob } from './types';
-import { geocodeBatch } from './geocoding';
+import { geocodeBatch, normalizeAddressWithGoogle, type GeocodeBatchResult } from './geocoding';
 import { incrementMetric, recordTiming } from './metrics';
 import { generateLookupCacheKey, getCachedLookupResult, setCachedLookupResult } from './cache';
 import { pickDataset } from './utils';
@@ -74,13 +74,15 @@ export async function processBatchLookup(
   }
 }
 
-// Process batch lookup with batch geocoding
+// Process batch lookup with batch geocoding (GeoGratis-first). Optional normalization via Google when key configured.
 export async function processBatchLookupWithBatchGeocoding(
-  env: Env, 
+  env: Env,
   requests: BatchLookupRequest[],
-  geocodeIfNeeded: (env: Env, query: any, request?: Request) => Promise<{ lon: number; lat: number }>,
+  geocodeIfNeeded: (env: Env, query: any, request?: Request) => Promise<{ lon: number; lat: number; normalizedAddress?: string }>,
   lookupRiding: (env: Env, pathname: string, lon: number, lat: number) => Promise<any>,
-  geocodeBatchFn: (env: Env, queries: any[], request?: Request) => Promise<Array<{ lon: number; lat: number; success: boolean; error?: string }>>
+  geocodeBatchFn: (env: Env, queries: any[], request?: Request, circuitBreaker?: { execute: (key: string, fn: () => Promise<any>) => Promise<any> }) => Promise<GeocodeBatchResult[]>,
+  request?: Request,
+  circuitBreaker?: { execute: (key: string, fn: () => Promise<any>) => Promise<any> }
 ): Promise<BatchLookupResponse[]> {
   // Validate batch size
   if (requests.length > MAX_BATCH_SIZE) {
@@ -117,37 +119,46 @@ export async function processBatchLookupWithBatchGeocoding(
       }
     }
     
+    const hasGoogleKey = () => !!(request?.headers?.get?.('X-Google-API-Key') ?? env.GOOGLE_MAPS_KEY);
+    const resolveNormalized = async (lat: number, lon: number): Promise<string | undefined> => {
+      if (!hasGoogleKey()) return undefined;
+      const v = await normalizeAddressWithGoogle(env, lat, lon, request, circuitBreaker);
+      return v ?? undefined;
+    };
+
     // Process coordinates-provided requests immediately
     for (const { request, index, lon, lat } of coordinatesProvided) {
       const startTime = Date.now();
       try {
-        // Check lookup cache
         const cacheKey = generateLookupCacheKey({ ...request.query, lon, lat }, request.pathname);
         const cachedResult = await getCachedLookupResult(env, cacheKey);
-        
+        let normalizedAddress: string | undefined = cachedResult?.normalizedAddress;
+
         if (cachedResult) {
+          if (normalizedAddress === undefined && hasGoogleKey()) normalizedAddress = await resolveNormalized(lat, lon);
           const processingTime = Date.now() - startTime;
           results[index] = {
             id: request.id,
             query: request.query,
             point: { lon, lat },
             properties: cachedResult.properties,
+            ...(normalizedAddress && { normalizedAddress }),
             processingTime
           };
         } else {
           const result = await lookupRiding(env, request.pathname, lon, lat);
+          if (hasGoogleKey()) normalizedAddress = await resolveNormalized(lat, lon);
           const processingTime = Date.now() - startTime;
-          
-          // Store result in cache
           const { r2Key } = pickDataset(request.pathname);
           const dataset = r2Key.replace('.geojson', '');
-          await setCachedLookupResult(env, cacheKey, result, dataset, { lon, lat });
-          
+          const toCache = { ...result, ...(normalizedAddress && { normalizedAddress }) };
+          await setCachedLookupResult(env, cacheKey, toCache, dataset, { lon, lat });
           results[index] = {
             id: request.id,
             query: request.query,
             point: { lon, lat },
             properties: result.properties,
+            ...(normalizedAddress && { normalizedAddress }),
             processingTime
           };
         }
@@ -163,10 +174,10 @@ export async function processBatchLookupWithBatchGeocoding(
       }
     }
     
-    // Process geocoding-needed requests in batches
+    // Process geocoding-needed requests in batches (GeoGratis-first via geocodeBatchFn)
     if (geocodingNeeded.length > 0) {
       const queries = geocodingNeeded.map(item => item.request.query);
-      const geocodingResults = await geocodeBatchFn(env, queries);
+      const geocodingResults = await geocodeBatchFn(env, queries, request, circuitBreaker);
       
       for (let i = 0; i < geocodingNeeded.length; i++) {
         const { request, index } = geocodingNeeded[i];
@@ -175,12 +186,15 @@ export async function processBatchLookupWithBatchGeocoding(
         
         if (geocodingResult.success) {
           try {
-            // Check lookup cache
             const cacheKey = generateLookupCacheKey(
               { ...request.query, lon: geocodingResult.lon, lat: geocodingResult.lat },
               request.pathname
             );
             const cachedResult = await getCachedLookupResult(env, cacheKey);
+            let normalizedAddress: string | undefined = geocodingResult.normalizedAddress ?? cachedResult?.normalizedAddress;
+            if (normalizedAddress === undefined && hasGoogleKey()) {
+              normalizedAddress = await resolveNormalized(geocodingResult.lat, geocodingResult.lon);
+            }
             
             if (cachedResult) {
               const processingTime = Date.now() - startTime;
@@ -189,22 +203,22 @@ export async function processBatchLookupWithBatchGeocoding(
                 query: request.query,
                 point: { lon: geocodingResult.lon, lat: geocodingResult.lat },
                 properties: cachedResult.properties,
+                ...(normalizedAddress && { normalizedAddress }),
                 processingTime
               };
             } else {
               const result = await lookupRiding(env, request.pathname, geocodingResult.lon, geocodingResult.lat);
               const processingTime = Date.now() - startTime;
-              
-              // Store result in cache
               const { r2Key } = pickDataset(request.pathname);
               const dataset = r2Key.replace('.geojson', '');
-              await setCachedLookupResult(env, cacheKey, result, dataset, { lon: geocodingResult.lon, lat: geocodingResult.lat });
-              
+              const toCache = { ...result, ...(normalizedAddress && { normalizedAddress }) };
+              await setCachedLookupResult(env, cacheKey, toCache, dataset, { lon: geocodingResult.lon, lat: geocodingResult.lat });
               results[index] = {
                 id: request.id,
                 query: request.query,
                 point: { lon: geocodingResult.lon, lat: geocodingResult.lat },
                 properties: result.properties,
+                ...(normalizedAddress && { normalizedAddress }),
                 processingTime
               };
             }

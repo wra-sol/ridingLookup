@@ -65,11 +65,10 @@ export class LRUCache<K, V> {
       return undefined;
     }
 
-    // Check expiration
+    // Check expiration - but don't remove it, just return undefined
+    // Expired entries will be removed when cache is full and needs space
     const age = Date.now() - entry.timestamp;
     if (age > this.maxAge) {
-      // Entry expired, remove it
-      this.delete(key);
       return undefined;
     }
 
@@ -89,11 +88,29 @@ export class LRUCache<K, V> {
       return;
     }
 
-    // If at capacity, remove least recently used
+    // If at capacity, first try to remove expired entries
     if (this.cache.size >= this.maxSize) {
-      const lruKey = this.accessOrder.shift();
-      if (lruKey) {
-        this.cache.delete(lruKey);
+      // Remove expired entries first (oldest first)
+      let expiredRemoved = false;
+      for (let i = 0; i < this.accessOrder.length; i++) {
+        const testKey = this.accessOrder[i];
+        const testEntry = this.cache.get(testKey);
+        if (testEntry) {
+          const age = now - testEntry.timestamp;
+          if (age > this.maxAge) {
+            this.delete(testKey);
+            expiredRemoved = true;
+            break; // Only remove one expired entry at a time
+          }
+        }
+      }
+      
+      // If no expired entries found, remove least recently used
+      if (!expiredRemoved) {
+        const lruKey = this.accessOrder.shift();
+        if (lruKey) {
+          this.cache.delete(lruKey);
+        }
       }
     }
 
@@ -107,10 +124,10 @@ export class LRUCache<K, V> {
       return false;
     }
 
-    // Check expiration
+    // Check expiration - but don't remove it, just return false
+    // Expired entries will be removed when cache is full and needs space
     const age = Date.now() - entry.timestamp;
     if (age > this.maxAge) {
-      this.delete(key);
       return false;
     }
 
@@ -523,6 +540,7 @@ export async function setCachedLookupResult(env: Env, cacheKey: string, result: 
       properties: result.properties,
       riding: result.riding,
       point,
+      normalizedAddress: result.normalizedAddress,
       timestamp: Date.now(),
       dataset
     };

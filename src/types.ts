@@ -129,6 +129,7 @@ export interface QueryParams {
 export interface LookupResult {
   properties: Record<string, unknown> | null;
   riding?: string;
+  normalizedAddress?: string;
 }
 
 // Lookup cache entry structure
@@ -136,6 +137,7 @@ export interface LookupCacheEntry {
   properties: Record<string, unknown> | null;
   riding?: string;
   point?: { lon: number; lat: number };
+  normalizedAddress?: string;
   timestamp: number;
   dataset: string;
 }
@@ -160,6 +162,7 @@ export interface BatchLookupResponse {
   query: QueryParams;
   point?: { lon: number; lat: number };
   properties: Record<string, unknown> | null;
+  normalizedAddress?: string;
   error?: string;
   processingTime: number;
 }
