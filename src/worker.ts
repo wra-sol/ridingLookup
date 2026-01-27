@@ -1103,8 +1103,8 @@ export default {
           let normalizedAddress = geocodeResult.normalizedAddress;
           let addressComponents = geocodeResult.addressComponents;
           
-          // If we don't have address components yet, try to get them via reverse geocoding
-          if (!addressComponents && (request?.headers.get('X-Google-API-Key') || env.GOOGLE_MAPS_KEY)) {
+          // Always try to get normalized address via reverse geocoding when Google API key is available
+          if (request?.headers.get('X-Google-API-Key') || env.GOOGLE_MAPS_KEY) {
             const googleResult = await normalizeAddressWithGoogle(env, geocodeResult.lat, geocodeResult.lon, request, cb);
             if (googleResult) {
               normalizedAddress = googleResult.formattedAddress;

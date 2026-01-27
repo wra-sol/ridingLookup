@@ -136,7 +136,8 @@ export async function processBatchLookupWithBatchGeocoding(
         let addressComponents = cachedResult?.addressComponents;
 
         if (cachedResult) {
-          if ((normalizedAddress === undefined || addressComponents === undefined) && hasGoogleKey()) {
+          // Always try to get normalized address via reverse geocoding when Google API key is available
+          if (hasGoogleKey()) {
             const googleResult = await resolveNormalized(lat, lon);
             if (googleResult) {
               normalizedAddress = googleResult.formattedAddress;
@@ -212,7 +213,8 @@ export async function processBatchLookupWithBatchGeocoding(
             const cachedResult = await getCachedLookupResult(env, cacheKey);
             let normalizedAddress: string | undefined = geocodingResult.normalizedAddress ?? cachedResult?.normalizedAddress;
             let addressComponents = geocodingResult.addressComponents ?? cachedResult?.addressComponents;
-            if ((normalizedAddress === undefined || addressComponents === undefined) && hasGoogleKey()) {
+            // Always try to get normalized address via reverse geocoding when Google API key is available
+            if (hasGoogleKey()) {
               const googleResult = await resolveNormalized(geocodingResult.lat, geocodingResult.lon);
               if (googleResult) {
                 normalizedAddress = googleResult.formattedAddress;
